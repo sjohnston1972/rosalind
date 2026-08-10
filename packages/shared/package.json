@@ -13,10 +13,10 @@
     "test:coverage": "vitest run --coverage --coverage.thresholds.lines=71 --coverage.thresholds.functions=0 --coverage.thresholds.statements=71 --coverage.thresholds.branches=19"
   },
   "dependencies": {
-    "zod": "^3.25.76"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "typescript": "^5.8.3",
-    "vitest": "^3.2.4"
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
   }
 }

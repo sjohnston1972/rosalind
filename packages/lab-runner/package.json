@@ -11,12 +11,12 @@
   },
   "dependencies": {
     "@darwin/shared": "0.1.0",
-    "@playwright/test": "^1.61.1"
+    "@playwright/test": "^1.62.1"
   },
   "devDependencies": {
-    "@types/node": "^24.0.10",
-    "tsx": "^4.20.3",
-    "typescript": "^5.8.3",
-    "vitest": "^3.2.4"
+    "@types/node": "^26.1.2",
+    "tsx": "^4.23.10",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
   }
 }
