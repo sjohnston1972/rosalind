@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { DarwinLabView } from './LabView';
@@ -120,8 +120,17 @@ const jsonResponse = (body: unknown, status: number) =>
     headers: { 'Content-Type': 'application/json' },
   });
 
+const flush = async () => {
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+};
+
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 describe('Darwin Lab view', () => {
@@ -213,5 +222,77 @@ describe('Darwin Lab view', () => {
       populationWorkspace!.compareDocumentPosition(replay!) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
+  });
+
+  it('drops a stale poll response that resolves after a newer one', async () => {
+    vi.useFakeTimers();
+    const pending: Array<{ resolve: (value: Response) => void }> = [];
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/api/lab/experiments')) {
+        let resolve!: (value: Response) => void;
+        const promise = new Promise<Response>((res) => {
+          resolve = res;
+        });
+        pending.push({ resolve });
+        return promise;
+      }
+      return Promise.resolve(jsonResponse({ experiments: [] }, 200));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(
+      <DarwinLabView
+        apiBaseUrl="http://localhost:8787"
+        liveReasoningAvailable={false}
+      />,
+    );
+    await flush();
+    expect(pending).toHaveLength(1);
+
+    // The initial (mount) load resolves with a non-terminal experiment, so
+    // the 2s live poll starts.
+    await act(async () => {
+      pending[0]!.resolve(jsonResponse({ experiments: [draftExperiment] }, 200));
+    });
+    await flush();
+    expect(screen.getByRole('heading', { name: goalText })).toBeVisible();
+
+    // The poll fires on a fixed 2s cadence regardless of whether the prior
+    // tick's request has resolved yet, so two ticks in a row here produce
+    // two overlapping in-flight requests - the second poll (request #3)
+    // starts before the first poll (request #2) has come back.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(pending).toHaveLength(2);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(pending).toHaveLength(3);
+
+    // The newer request (#3) resolves first with the finished run...
+    await act(async () => {
+      pending[2]!.resolve(
+        jsonResponse({ experiments: [finishedExperiment] }, 200),
+      );
+    });
+    await flush();
+    expect(
+      screen.getByRole('heading', { name: 'Novice · success' }),
+    ).toBeVisible();
+
+    // ...then the stale request (#2) resolves late with an outdated, empty
+    // page. Its load generation no longer matches the latest load, so it
+    // must be dropped rather than blanking the population the newer
+    // response just rendered.
+    await act(async () => {
+      pending[1]!.resolve(jsonResponse({ experiments: [] }, 200));
+    });
+    await flush();
+
+    expect(
+      screen.getByRole('heading', { name: 'Novice · success' }),
+    ).toBeVisible();
   });
 });
