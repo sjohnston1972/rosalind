@@ -35,6 +35,39 @@ const eventPollMaximumMs = 30_000;
 const executionPollBaseMs = 3_000;
 const retryJitterMs = 500;
 
+/**
+ * Merge a freshly fetched first page of observation archives against
+ * whatever is already loaded, instead of always replacing it outright.
+ *
+ * A plain refresh (manual "Refresh" click, or the demo-reset-complete
+ * poll) only ever re-fetches page one. If the operator had paginated
+ * further back with "Load older observation records" - which is exactly
+ * how a rare evidence-class filter surfaces enough matching rows to be
+ * useful - replacing the array wholesale silently discarded every older
+ * page and reset pagination back to page one, undoing the filtered view.
+ * When more is already loaded than the fresh page contains, keep the
+ * older, still-valid rows appended after the fresh ones and leave the
+ * existing cursor alone so "Load older" can keep going from there.
+ */
+export const mergeObservationArchivesPage = (
+  current: ObservationArchiveSummary[],
+  currentNextCursor: string | null,
+  freshPage: ObservationArchiveSummary[],
+  freshNextCursor: string | null,
+): { archives: ObservationArchiveSummary[]; nextCursor: string | null } => {
+  if (current.length <= freshPage.length) {
+    return { archives: freshPage, nextCursor: freshNextCursor };
+  }
+  const freshIds = new Set(freshPage.map((archive) => archive.archiveId));
+  return {
+    archives: [
+      ...freshPage,
+      ...current.filter((archive) => !freshIds.has(archive.archiveId)),
+    ],
+    nextCursor: currentNextCursor,
+  };
+};
+
 export interface LiveTelemetryOptions {
   canInspectEvidence?: boolean;
   eventPollingEnabled?: boolean;
@@ -267,12 +300,18 @@ export function useLiveTelemetry({
 
   const refreshObservationArchives = async () => {
     const result = await loadObservationArchives();
-    setObservationArchives(result.archives);
-    setObservationArchivesNextCursor(result.page.nextCursor);
+    const merged = mergeObservationArchivesPage(
+      observationArchives,
+      observationArchivesNextCursor,
+      result.archives,
+      result.page.nextCursor,
+    );
+    setObservationArchives(merged.archives);
+    setObservationArchivesNextCursor(merged.nextCursor);
     const deepLinkedId = artifactDeepLink('observation');
     if (
       deepLinkedId &&
-      !result.archives.some((archive) => archive.archiveId === deepLinkedId)
+      !merged.archives.some((archive) => archive.archiveId === deepLinkedId)
     ) {
       await loadObservationArchive(deepLinkedId);
     }
@@ -609,14 +648,18 @@ export function useLiveTelemetry({
     }
 
     if (archiveResult.status === 'fulfilled' && archiveResult.value) {
-      setObservationArchives(archiveResult.value.archives);
-      setObservationArchivesNextCursor(archiveResult.value.page.nextCursor);
+      const merged = mergeObservationArchivesPage(
+        observationArchives,
+        observationArchivesNextCursor,
+        archiveResult.value.archives,
+        archiveResult.value.page.nextCursor,
+      );
+      setObservationArchives(merged.archives);
+      setObservationArchivesNextCursor(merged.nextCursor);
       const deepLinkedId = artifactDeepLink('observation');
       if (
         deepLinkedId &&
-        !archiveResult.value.archives.some(
-          (archive) => archive.archiveId === deepLinkedId,
-        )
+        !merged.archives.some((archive) => archive.archiveId === deepLinkedId)
       ) {
         try {
           await loadObservationArchive(deepLinkedId);

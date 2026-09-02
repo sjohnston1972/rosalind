@@ -1,10 +1,12 @@
-import { act, cleanup, renderHook } from '@testing-library/react';
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  mergeObservationArchivesPage,
   shouldPollRepositoryExecution,
   useLiveTelemetry,
 } from './useLiveTelemetry';
+import type { ObservationArchiveSummary } from '@darwin/shared';
 
 const timestamp = '2026-07-18T10:00:00.000Z';
 const event = {
@@ -74,6 +76,46 @@ const installApi = (
     fetchMock,
   };
 };
+
+const archiveSummary = (archiveId: string): ObservationArchiveSummary => ({
+  archiveId,
+  evidence: {
+    evidenceId: `evidence-${archiveId}`,
+    evidenceHash: '1'.repeat(64),
+    generatedAt: timestamp,
+    evidenceClass: 'measured',
+    study: {
+      studyId: 'projectflow-baseline-study',
+      appVersion: '1.0.0',
+      measuredCommit: null,
+      deploymentVerifiedAt: null,
+      sourceEventCount: 0,
+      participants: 3,
+      sessions: 3,
+      attempts: 3,
+    },
+    quality: { strength: 'substantial', score: 90 },
+    signalCount: 0,
+    fitness: {
+      terminalAttemptCount: 0,
+      completedAttemptCount: 0,
+      medianInteractions: null,
+    },
+  },
+  analysis: {
+    analysisId: `analysis-${archiveId}`,
+    model: 'gpt-test',
+    createdAt: timestamp,
+    selectedMutation: { id: 'mutation-1', title: 'Mutation' },
+  },
+  execution: {
+    executionId: archiveId,
+    manifestId: `manifest-${archiveId}`,
+    status: 'released',
+    createdAt: timestamp,
+    completedAt: timestamp,
+  },
+});
 
 const settle = async () => {
   await act(async () => {
@@ -231,5 +273,131 @@ describe('visibility-aware live telemetry', () => {
     expect(result.current.status).toBe('live');
     expect(result.current.pollingState).toBe('fresh');
     expect(result.current.lastUpdatedAt).not.toBeNull();
+  });
+});
+
+describe('mergeObservationArchivesPage', () => {
+  it('replaces outright when nothing has been paginated beyond the fresh page', () => {
+    const fresh = [archiveSummary('a'), archiveSummary('b')];
+    const merged = mergeObservationArchivesPage([], null, fresh, 'cursor-2');
+    expect(merged).toEqual({ archives: fresh, nextCursor: 'cursor-2' });
+  });
+
+  it('keeps older paginated rows and the prior cursor when more is already loaded', () => {
+    const current = [
+      archiveSummary('a'),
+      archiveSummary('b'),
+      archiveSummary('c'),
+      archiveSummary('d'),
+    ];
+    const fresh = [archiveSummary('a'), archiveSummary('b')];
+    const merged = mergeObservationArchivesPage(
+      current,
+      null,
+      fresh,
+      'cursor-fresh',
+    );
+    expect(merged.archives.map((archive) => archive.archiveId)).toEqual([
+      'a',
+      'b',
+      'c',
+      'd',
+    ]);
+    // The already-exhausted cursor is preserved rather than adopting the
+    // fresh page's cursor, which would just re-offer already-loaded rows.
+    expect(merged.nextCursor).toBeNull();
+  });
+
+  it('does not duplicate a row the fresh page and the older pages share', () => {
+    const current = [
+      archiveSummary('a'),
+      archiveSummary('b'),
+      archiveSummary('c'),
+    ];
+    const fresh = [archiveSummary('c'), archiveSummary('b')];
+    const merged = mergeObservationArchivesPage(
+      current,
+      'cursor-old',
+      fresh,
+      'cursor-new',
+    );
+    expect(merged.archives.map((archive) => archive.archiveId)).toEqual([
+      'c',
+      'b',
+      'a',
+    ]);
+    expect(merged.nextCursor).toBe('cursor-old');
+  });
+});
+
+describe('observation archive pagination', () => {
+  it('survives a refresh after loading an older page', async () => {
+    let archiveCall = 0;
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('/events/raw?limit=200')) {
+        return response(eventResponse([], null, 0));
+      }
+      if (url.includes('/api/genome?')) {
+        return response({
+          evolutionCycle: {
+            studyId: 'projectflow-baseline-study',
+            startedAt: null,
+            genomeEvolutionCount: 0,
+          },
+          executions: [],
+          page: { limit: 10, nextCursor: null },
+        });
+      }
+      if (url.includes('/api/observations/archives?')) {
+        archiveCall += 1;
+        if (url.includes('cursor=cursor-1')) {
+          return response({
+            archives: [archiveSummary('c'), archiveSummary('d')],
+            page: { limit: 10, nextCursor: null },
+          });
+        }
+        return response({
+          archives: [archiveSummary('a'), archiveSummary('b')],
+          page: { limit: 10, nextCursor: 'cursor-1' },
+        });
+      }
+      if (url.includes('/evidence/latest')) return response(null, 204);
+      return response(null, 204);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { result } = renderHook(() =>
+      useLiveTelemetry({
+        eventPollingEnabled: false,
+        executionPollingEnabled: false,
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        result.current.observationArchives.map((a) => a.archiveId),
+      ).toEqual(['a', 'b']),
+    );
+    expect(result.current.observationArchivesNextCursor).toBe('cursor-1');
+
+    await act(async () => {
+      await result.current.loadMoreObservationArchives();
+    });
+    expect(result.current.observationArchives.map((a) => a.archiveId)).toEqual(
+      ['a', 'b', 'c', 'd'],
+    );
+    expect(result.current.observationArchivesNextCursor).toBeNull();
+
+    await act(async () => {
+      await result.current.refresh();
+    });
+    // A plain refresh only ever re-fetches page one; the older page loaded
+    // via "Load older observation records" must not be discarded, and the
+    // exhausted cursor must not be reset to page one's cursor.
+    expect(result.current.observationArchives.map((a) => a.archiveId)).toEqual(
+      ['a', 'b', 'c', 'd'],
+    );
+    expect(result.current.observationArchivesNextCursor).toBeNull();
+    expect(archiveCall).toBeGreaterThanOrEqual(3);
   });
 });
