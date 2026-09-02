@@ -20,10 +20,19 @@ identifiers.
 ## 0. What this revision is, and why the previous one could not be trusted
 
 Rev 2 was written on 2026-07-20 against a branch that has since moved a long way. Revalidating each
-row against a named test file and a named test at the pinned commit produced **46 status corrections
-across 44 cases** — in both directions. The most important output of this revision is not the
+row against a named test file and a named test at the pinned commit produced **50 status corrections
+across 48 cases** — in both directions. The most important output of this revision is not the
 corrected table cells; it is §17, which records exactly where the previous revision **claimed
 coverage that does not exist**. Highlights:
+
+- **`SEC-041`/`API-074`** (workspace IDOR: participant A's token on participant B's path → 403) was
+  `[covered]`, citing a test that persists one participant's workspace with **no study-session token
+  at all** — it runs through the localhost dev-bypass and never constructs a second participant. The
+  guard itself is real code (`index.ts:3775`); it has zero regression coverage. This is a fixed prior
+  vulnerability (S1) with nothing standing between it and silently regressing.
+- **`GH-005`** (path traversal / `baseSha` regex / branch encoding) was `[covered]`, citing two tests
+  that check an over-broad-but-valid config and a control-character-laden file body — neither ever
+  supplies a traversal string as a `contextPath`.
 
 - **`API-021`** (unauthenticated non-localhost request must 503) was `[covered]`. Nothing tests it.
   The string `authentication_unavailable` appears in `security/auth.ts` and in **no test file**.
@@ -270,7 +279,7 @@ have an explicit capability; unmatched routes fail closed with 404 before author
 | API-071 | `GET .../events/raw?limit≤200&cursor`                       | 200 page; 400 on a bad cursor  | [covered] | `index.test.ts` "ingests, deduplicates, and exposes ordered real telemetry" (paged reads plus `?cursor=not-a-cursor` → 400); `persistence/pagination.test.ts` "returns bounded stable pages across many evolution cycles". *Nuance: the 400 **status** is asserted, the `invalid_cursor` error **code** is not* |
 | API-072 | `GET .../sessions/:sid`                                     | 200 ordered trace              | [covered] | `index.test.ts` "ingests, deduplicates, and exposes ordered real telemetry"; also exercised end-to-end in `e2e/demo.spec.ts` |
 | API-073 | `GET .../participants/:pid/workspace` valid session subject | 200                            | [covered] | `index.test.ts` "persists participant-specific ProjectFlow workspaces"                       |
-| API-074 | Workspace GET with session subject ≠ path participant       | 403 subject mismatch           | [covered] | same test (regression guard for the fixed IDOR, prior S1)                                    |
+| API-074 | Workspace GET with session subject ≠ path participant       | 403 subject mismatch           | [gap] | `study_session_subject_mismatch` (`index.ts:3775`) exists in code but is asserted by **no test**. "persists participant-specific ProjectFlow workspaces" (cited by Rev 3 as this case's regression guard) uses one participant id, no study-session token, and runs through the unauthenticated localhost `local-development` bypass — it proves persistence, not the IDOR guard |
 | API-075 | `PUT .../workspace` valid / 400 / 413                       | correct                        | [partial] | valid PUT covered by the same test. **400 and 413 on this route are not asserted**            |
 
 ### 5.7 Evidence & reasoning
@@ -353,8 +362,8 @@ Against programmable `fetch` doubles; assert endpoint, method, payload and timeo
 | GH-004b| Single-file size bound (≤128 KiB)                                                         | rejected before materialising   | [covered] | `github-source.test.ts` "caps streamed context files before materialising them"       |
 | GH-004c| Concurrency bound (≤4 concurrent downloads)                                               | no subrequest storm             | [covered] | `github-source.test.ts` "limits concurrent context downloads"                         |
 | GH-004d| Config size (≤64 KiB) and aggregate size (≤512 KiB) bounds                                 | rejected                        | [gap]     | neither bound has a test                                                              |
-| GH-005 | Path traversal in a context path rejected; `baseSha` regex; branch encoded                | rejected                        | [covered] | `github-source.test.ts` "rejects prompt control characters in repository context" and "rejects malformed or over-broad target configuration" |
-| GH-006 | GitHub fetch beyond the timeout is aborted                                                 | timeout signal                  | [covered] | `github-source.test.ts` "bounds GitHub request duration"                              |
+| GH-005 | Path traversal in a context path rejected; `baseSha` regex; branch encoded                | rejected                        | [gap]     | `assertPath` (`github-source.ts:117`) implements this, but neither cited test ever passes a traversal string (`..`, `%2e%2e`, a leading `/`) as a `contextPath` — "rejects prompt control characters" feeds control bytes into file *content*, and "rejects malformed or over-broad target configuration" tests an over-broad path *count*, not a traversal path. No test touches the `baseSha` regex or `encodeURIComponent(branch)` either |
+| GH-006 | GitHub fetch beyond the timeout is aborted                                                 | timeout signal                  | [partial] | `github-source.test.ts` "bounds GitHub request duration" proves the abort mechanism via an injected `requestTimeoutMs: 5` override. **No test confirms the production default (`GITHUB_REQUEST_TIMEOUT_MS = 10_000`) is what is actually wired in when the override is omitted** |
 | GH-020 | `dispatchEvolutionWorkflow` → `darwin-evolve.yml/dispatches` with all inputs               | correct payload, secret not leaked | [covered] | `repository/github-actions.test.ts` "dispatches the pinned manifest without exposing the callback secret" |
 | GH-021 | `dispatchRollbackWorkflow` → `darwin-rollback.yml/dispatches`                              | correct workflow + inputs       | [covered] | `github-actions.test.ts` "dispatches and merges a separately reviewable rollback"     |
 | GH-022 | `dispatchResetWorkflow` → `darwin-reset.yml/dispatches`                                    | correct workflow + inputs       | [covered] | `github-actions.test.ts` "merges only the reviewed execution head and dispatches reset" |
@@ -379,7 +388,7 @@ Against programmable `fetch` doubles; assert endpoint, method, payload and timeo
 | SEC-021 | Wrong execution / wrong repository / expired credential                                            | rejected                     | [covered] | `security/callback.test.ts` "rejects wrong execution, wrong repository, and expired credentials" |
 | SEC-022 | Callback replay                                                                                     | consumed once only           | [covered] | `security/callback.test.ts` "accepts one execution-bound signature and rejects its replay"; `index.test.ts` reset-callback replay within the reset lifecycle test |
 | SEC-040 | Study-session valid round-trip; tampered / expired → rejected                                       | correct                      | [covered] | `security/study-session.test.ts` "issues stable anonymous subjects and short-lived verifiable sessions" and "rejects token tampering and wrong secrets" |
-| SEC-041 | Workspace IDOR guard: token for participant A on participant B's path → 403                        | rejected                     | [covered] | `index.test.ts` "persists participant-specific ProjectFlow workspaces" (regression guard for prior S1) |
+| SEC-041 | Workspace IDOR guard: token for participant A on participant B's path → 403                        | rejected                     | [gap]     | same finding as API-074: the guard exists in code (`index.ts:3775`) but the only nearby test never signs a study-session token or uses a second participant, so it runs through the localhost dev-bypass and proves nothing about IDOR |
 | SEC-042 | `anonymousStudyParticipantId` is deterministic **and** pseudonymous                                 | no PII                       | [partial] | determinism covered (`study-session.test.ts` "issues stable anonymous subjects…"). **Nothing asserts the subject contains no input-derived PII** |
 | SEC-060 | Per-route body caps via bounded stream; chunked bypass closed                                       | 413 at each                  | [covered] | `security/bounded-body.test.ts` "rejects a chunked body before materialising bytes beyond the limit" and "rejects invalid UTF-8" |
 | SEC-061 | SQL: no interpolated user value                                                                     | static/review test           | [gap]     | no custom lint rule in `eslint.config.js`, no test                                     |
@@ -688,7 +697,7 @@ original wording could not be consulted — rows say so where it matters.
 | B3 "friction scale"                      | —                    | **Unverifiable.** No code, test, or commit in this repository matches this description, and `audit-report.md` is absent, so the original claim cannot be read. Rev 2 mapped it to API-085 (a CPU-budget case), which does not match the description. Do not mark it closed; re-derive the finding or drop it |
 | Prior fixed — Lab `/claim` & `/runs` races | LAB-032, LAB-033   | [covered]                                                                                     |
 | Prior fixed — non-atomic release (B10)   | API-122             | [partial] — the CAS primitive is covered; a concurrent-release test is still missing          |
-| Prior fixed — workspace IDOR (S1)        | SEC-041, API-074    | [covered]                                                                                     |
+| Prior fixed — workspace IDOR (S1)        | SEC-041, API-074    | **[gap]** — the guard exists in code (`index.ts:3775`) but no test signs a study-session token or uses a second participant to exercise it |
 | Prior fixed — unbounded body (S2)        | SEC-060, API-055    | [covered]                                                                                     |
 | Prior fixed — target signing (M1)        | SEC-001, SEC-002    | SEC-002 [covered]; **SEC-001 is only [partial]** — the body/targetId/clientKey bindings are unproven |
 | Prior fixed — rate-limit key bypass (S3) | SEC-064, GW-003     | [gap] both sides; the deciding logic is in the gateway repository                             |
@@ -747,7 +756,7 @@ not listed here is hardening and must not be quoted as a release claim, however 
 **Cases that must be `[covered]` and passing:**
 
 - **Authorization and trust boundaries:** API-006, API-008, API-011, API-022, API-024, API-027,
-  SEC-002, SEC-004, SEC-020, SEC-021, SEC-022, SEC-040, SEC-041, SEC-060, SEC-067.
+  SEC-002, SEC-004, SEC-020, SEC-021, SEC-022, SEC-040, SEC-060, SEC-067.
 - **Telemetry integrity:** API-052, API-053, API-056, API-057, API-058, API-060, TEL-001, TEL-002,
   TEL-003, TEL-005, TEL-006, TEL-007, TEL-008, TEL-009, TEL-010, TEL-012.
 - **Evidence and reasoning integrity:** API-080, API-083, API-084, API-086, API-088, API-089.
@@ -771,6 +780,7 @@ not listed here is hardening and must not be quoted as a release claim, however 
 | SEC-066 | The `local-development` full-capability bypass has no test pinning it to localhost-with-no-secrets.          | [gap]     |
 | API-162 | A wrong confirmation string must not start a destructive reset.                                              | [gap]     |
 | API-082 | An evidence pack must not be generated from too few events. `insufficient_evidence` has no test.              | [gap]     |
+| SEC-041, API-074 | The workspace IDOR guard (`study_session_subject_mismatch`, `index.ts:3775`) exists in code but no test signs a study-session token or supplies a second participant to exercise it — the nearest test runs through the localhost dev-bypass instead. This is a fixed prior vulnerability (S1) with zero regression coverage. | [gap]     |
 
 ### 16.2 Long-term hardening (P1/P2) — tracked, never a release claim
 
@@ -798,10 +808,10 @@ Ordered by value:
 
 ## 17. Revalidation ledger — where Rev 2 was wrong
 
-Every row below was checked against a named test at `6513e43`. **46 status corrections across 44
-cases.** The 19 rows marked ⚠ are where Rev 2 **claimed coverage that does not exist** — the
-category this rebaseline was commissioned to find. (Eighteen are wrong statuses; the nineteenth,
-LAB-001, keeps its status but carried a false sub-claim.)
+Every row below was checked against a named test at `6513e43`. **50 status corrections across 48
+cases.** The 22 rows marked ⚠ are where Rev 2 **claimed coverage that does not exist** — the
+category this rebaseline was commissioned to find. (Twenty-one are wrong statuses; the
+twenty-second, LAB-001, keeps its status but carried a false sub-claim.)
 
 | Case      | Rev 2       | Rev 3      | Why                                                                                             |
 | --------- | ----------- | ---------- | ------------------------------------------------------------------------------------------------- |
@@ -844,6 +854,10 @@ LAB-001, keeps its status but carried a false sub-claim.)
 | LC-002    | [partial]   | [covered]  | the rollback path is driven end-to-end in a real browser by the `@smoke` E2E                      |
 | NF-001/003/004/005 | mixed | [covered] | see §15 — NF-004 in particular went from `[gap]` to fully covered this cycle                    |
 | B5 / B11 / B3 | "verify-and-close" | resolved individually | B5 [covered], B11 [gap], B3 **unverifiable** (no matching code, and `audit-report.md` is absent) |
+| ⚠ SEC-041 | [covered]   | [gap]      | the workspace IDOR guard (`study_session_subject_mismatch`, `index.ts:3775`) exists but no test signs a study-session token or supplies a second participant — a final independent cross-check against the cited test caught this after the rest of this ledger was written |
+| ⚠ API-074 | [covered]   | [gap]      | same finding as SEC-041 — the cited test ("persists participant-specific ProjectFlow workspaces") never exercises subject mismatch |
+| ⚠ GH-005  | [covered]   | [gap]      | `assertPath`/baseSha-regex/branch-encoding exist in code; neither cited test ever supplies a traversal path, a malformed sha, or a branch needing encoding |
+| GH-006    | [covered]   | [partial]  | the cited test proves the abort mechanism via an injected 5ms override; nothing confirms the production 10s default is what is wired in when the override is omitted |
 
 **Structural repairs** made alongside the status changes: compound cells (`[covered] → … [partial]`)
 split into separate IDs; `GH-021` split into GH-021/022/023 by workflow; `X-Darwin-Request-ID`
