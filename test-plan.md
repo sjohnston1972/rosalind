@@ -3,9 +3,9 @@
 **Rev 3 — rebaselined and revalidated case-by-case against the tree, not against memory.**
 
 **Baseline commit:** `6513e4372582598b6d03967842fc03b4a698a509` on `main` (2026-09-02).
-**Release tag at baseline:** none. The last tag is `v0.25.19` (`a6e7a40`, 2026-07-20); `main` is
-~40 commits ahead of it and `package.json` reads `0.25.20` (unreleased). This plan therefore pins a
-**commit**, not a release.
+**Release tag at baseline:** none. The last tag is `v0.25.19` (`a6e7a40`, 2026-07-20); `main` is 26
+commits ahead of it (`git rev-list --count v0.25.19..HEAD`) and `package.json` reads `0.25.20`
+(unreleased). This plan therefore pins a **commit**, not a release.
 **Plan revision:** the commit containing this document.
 
 **Naming.** The product is **Rosalind**. The npm workspace root, the Worker, the D1 database, the
@@ -20,10 +20,10 @@ identifiers.
 ## 0. What this revision is, and why the previous one could not be trusted
 
 Rev 2 was written on 2026-07-20 against a branch that has since moved a long way. Revalidating each
-row against a named test file and a named test at the pinned commit found **28 statuses that were
-wrong** — in both directions. The most important output of this revision is not the corrected table
-cells; it is §17, which records exactly where the previous revision **claimed coverage that does not
-exist**. Highlights:
+row against a named test file and a named test at the pinned commit produced **46 status corrections
+across 44 cases** — in both directions. The most important output of this revision is not the
+corrected table cells; it is §17, which records exactly where the previous revision **claimed
+coverage that does not exist**. Highlights:
 
 - **`API-021`** (unauthenticated non-localhost request must 503) was `[covered]`. Nothing tests it.
   The string `authentication_unavailable` appears in `security/auth.ts` and in **no test file**.
@@ -37,6 +37,11 @@ exist**. Highlights:
 - **`API-010`** (the cron `scheduled` handler runs the retention sweep) was `[covered]`. The sweep is
   well tested; the `scheduled()` entry point at `workers/api/src/index.ts:4138` is never invoked by
   any test.
+- **`API-082`** (too few events must yield 409 `insufficient_evidence`) was `[covered]`. That error is
+  raised at `index.ts:2205` and `:2365` and asserted nowhere.
+- **Six Observations/workspace UI rows** (`UI-040/042/045/046/047/100`) were `[covered]`. Their
+  controls — `Generate evidence`, the session-index toggle, `Retry repository run` — appear in no
+  test at all.
 
 Statuses in this document are only `[covered]` where this revision could name the file **and** the
 test. Where it could not, the row says `[partial]` or `[gap]` and says what is missing.
@@ -111,7 +116,7 @@ these figures.
 | Playwright spec **files**          | 5     | `find . -type f -name "*.spec.ts" -not -path "*/node_modules/*" \| wc -l`                                                                  |
 | Playwright **cases** (call sites)  | 17    | `grep -rhE "^\s*test\(" $(find . -type f -name "*.spec.ts" -not -path "*/node_modules/*") \| wc -l`                                        |
 | Declared API routes                | 68    | `grep -cE "^\| (GET\|POST\|PUT\|DELETE) " docs/generated/API_ROUTES.md` (regenerate with `npm run docs:generate`)                          |
-| D1 migrations                      | 24    | `ls workers/api/migrations \| wc -l`                                                                                                       |
+| D1 migrations                      | 25    | `ls workers/api/migrations \| wc -l`                                                                                                       |
 
 **Per-workspace test-case split at this commit** (`npm test`): `@darwin/api` 25 files / 139 tests ·
 `@darwin/web` 6 files / 35 tests · `@darwin/telemetry-client` 1 / 17 · `@darwin/shared` 2 / 14 ·
@@ -221,7 +226,7 @@ have an explicit capability; unmatched routes fail closed with 404 before author
 | ID      | Route                                                             | Cases                                                | Status    | Evidence / what is missing                                                                       |
 | ------- | ----------------------------------------------------------------- | ---------------------------------------------------- | --------- | -------------------------------------------------------------------------------------------------- |
 | API-030 | `GET /api/health`                                                 | 200 + schema; degrades when D1 unreachable           | [partial] | `index.test.ts` "returns a schema-valid health response". **Degraded-DB path not asserted**       |
-| API-031 | `GET /api/operations/metrics`                                     | 200 counters                                         | [covered] | `index.test.ts` "enforces configured per-study and per-target telemetry quotas" (metrics assertion) |
+| API-031 | `GET /api/operations/metrics`                                     | 200 counters                                         | [covered] | `index.test.ts` "accepts only signed ProjectFlow telemetry with configured provenance" (schema-parses the metrics body and asserts the request/accepted/duplicate counters) |
 | API-032 | `GET /api/diagnostics?limit≤100`                                  | 200 audit events + provider metrics                  | [covered] | `index.test.ts` "propagates request IDs and retains redacted privileged audit events"             |
 | API-033 | `POST /api/retention/sweep` (`delete_data`)                       | 200; prunes past-window rows                         | [covered] | `index.test.ts` "sweeps expired telemetry idempotently and records aggregate health"              |
 | API-034 | `DELETE /api/studies/:id/participants/:pid`                       | 200 deleted + evidence invalidated                   | [covered] | `index.test.ts` "deletes participant, study, and execution artifacts by explicit scope"           |
@@ -262,7 +267,7 @@ have an explicit capability; unmatched routes fail closed with 404 before author
 | ID      | Case                                                        | Expected                       | Status    | Evidence / what is missing                                                                 |
 | ------- | ----------------------------------------------------------- | ------------------------------ | --------- | -------------------------------------------------------------------------------------------- |
 | API-070 | `GET /api/studies/:id/events` summary                       | 200 counts                     | [covered] | `index.test.ts` "requires capability-scoped operator authorization on every control-plane route" (schema-parsed summary) |
-| API-071 | `GET .../events/raw?limit≤200&cursor`                       | 200 page; 400 `invalid_cursor` | [covered] | `index.test.ts` "ingests, deduplicates, and exposes ordered real telemetry"; `persistence/pagination.test.ts` "returns bounded stable pages across many evolution cycles" |
+| API-071 | `GET .../events/raw?limit≤200&cursor`                       | 200 page; 400 on a bad cursor  | [covered] | `index.test.ts` "ingests, deduplicates, and exposes ordered real telemetry" (paged reads plus `?cursor=not-a-cursor` → 400); `persistence/pagination.test.ts` "returns bounded stable pages across many evolution cycles". *Nuance: the 400 **status** is asserted, the `invalid_cursor` error **code** is not* |
 | API-072 | `GET .../sessions/:sid`                                     | 200 ordered trace              | [covered] | `index.test.ts` "ingests, deduplicates, and exposes ordered real telemetry"; also exercised end-to-end in `e2e/demo.spec.ts` |
 | API-073 | `GET .../participants/:pid/workspace` valid session subject | 200                            | [covered] | `index.test.ts` "persists participant-specific ProjectFlow workspaces"                       |
 | API-074 | Workspace GET with session subject ≠ path participant       | 403 subject mismatch           | [covered] | same test (regression guard for the fixed IDOR, prior S1)                                    |
@@ -274,9 +279,9 @@ have an explicit capability; unmatched routes fail closed with 404 before author
 | ------- | --------------------------------------------------------------------- | ------------------------------------------ | --------- | ---------------------------------------------------------------------------------------- |
 | API-080 | `POST .../evidence?source=real_user`                                 | 201 deterministic `EvidencePack`           | [covered] | `index.test.ts` "generates and persists a hashed evidence pack from real events"; `evidence/evidence.test.ts` "creates stable, traceable excess-path evidence" |
 | API-081 | `?source=` filter applied in the query, not after `LIMIT`            | correct count under other-source dominance | [partial] | evidence-class separation is covered (`evidence.test.ts` "rejects a measurement window containing mixed evidence classes"). **The filter-before-LIMIT ordering itself is not asserted** |
-| API-082 | Insufficient events                                                  | 409 `insufficient_evidence`                | [covered] | `index.test.ts` "starts the initial evidence window when the target is connected"       |
+| API-082 | Insufficient events                                                  | 409 `insufficient_evidence`                | [gap]     | `insufficient_evidence` is raised at `index.ts:2205` and `:2365` and appears in **no test file**. The nearest test, "starts the initial evidence window when the target is connected", asserts the *success* path only |
 | API-083 | Mixed app/telemetry versions                                         | 409                                        | [covered] | `index.test.ts` "rejects stale and mixed application versions before evidence generation"; `evidence.test.ts` "rejects a measurement window containing multiple application versions" |
-| API-084 | Lab-provenance events into measured evidence                         | 409 `lab_evidence_boundary`                | [covered] | `evidence.test.ts` "rejects a measurement window containing mixed evidence classes"; `lab/handler.test.ts` "runs a bounded population into separately labelled evidence" |
+| API-084 | Lab-provenance events into measured evidence                         | 409 `lab_evidence_boundary`                | [covered] | `lab/handler.test.ts` "runs a bounded population into separately labelled evidence" (asserts the `lab_evidence_boundary` code); `evidence/evidence.test.ts` "rejects a measurement window containing mixed evidence classes" |
 | API-085 | Large corpus (~10k events) completes within CPU budget               | no 500                                     | [covered] | `evidence/evidence.test.ts` "processes a deterministic 10,000-event study within a bounded budget" (Rev 2 said `[partial]`) |
 | API-086 | `POST .../analyse-evidence` mock mode                                | 201; cached repeat → 200                   | [covered] | `index.test.ts` "caches evidence analysis and creates a bounded Codex manifest"          |
 | API-087 | Analyse: repo snapshot unavailable / unattested source               | 502 / 409                                  | [partial] | fail-closed-without-live-GPT covered (`reasoning/reasoning.test.ts` "fails closed without live GPT instead of returning a substitute mutation"). **The 502 `repository_unavailable` route path is not asserted** |
@@ -313,9 +318,9 @@ have an explicit capability; unmatched routes fail closed with 404 before author
 
 | ID      | Case                                                                        | Expected      | Status    | Evidence / what is missing                                                          |
 | ------- | ----------------------------------------------------------------------------- | ------------- | --------- | -------------------------------------------------------------------------------------- |
-| API-140 | `GET /api/genome?limit≤25&cursor` → 200 page; 400 `invalid_pagination`       | bounded       | [covered] | `archive-pagination.test.ts` "keeps multi-cycle genome pages bounded and defers heavy records"; `index.test.ts` (`?limit=1000` rejection) |
+| API-140 | `GET /api/genome?limit≤25&cursor` → 200 page; 400 on an out-of-range limit   | bounded       | [covered] | `archive-pagination.test.ts` "keeps multi-cycle genome pages bounded and defers heavy records"; `index.test.ts` "caches evidence analysis and creates a bounded Codex manifest" (`?limit=1000` → 400). *Nuance: the 400 **status** is asserted, the `invalid_pagination` error **code** is not* |
 | API-141 | **M1: one corrupt row in a list** → page skips it, still 200                 | skip-and-log  | [partial] | the repository listers are covered (`persistence/telemetry-d1.test.ts` "skips corrupt execution rows without blanking fossil-record pages", "…corrupt telemetry event rows…", "…corrupt operational audit event rows…"). **No test drives `GET /api/genome` itself with a planted corrupt row**, which is what this case describes |
-| API-142 | `GET /api/genome/:id` / `GET /api/observations/archives[/:id]`               | 200 / 404     | [covered] | `index.test.ts` genome/archive detail assertions within the lifecycle test            |
+| API-142 | `GET /api/genome/:id` / `GET /api/observations/archives[/:id]`               | 200 / 404     | [covered] | `index.test.ts` "caches evidence analysis and creates a bounded Codex manifest" (genome detail, archive list and archive detail reads)  |
 | API-143 | `POST /api/simulations` seed==`DARWIN_DEMO_SEED` → 201, deterministic        | correct       | [covered] | `simulation/simulate.test.ts` "returns the same summary and event stream for the same seed"; `index.test.ts` "creates and retrieves an exactly 10,000-event simulation summary" |
 | API-144 | Wrong seed/variant → 403/400; rate-limited → 429 + `Retry-After: 60`; in-flight → 503 + `Retry-After: 5` | correct | [covered] | `index.test.ts` "rejects unconfigured simulation seeds and evolved variants", "rate limits simulations on the authenticated operator identity" (asserts `Retry-After: 60`), "admits only one simulation request at a time" (asserts `Retry-After: 5`) |
 | API-145 | `GET /api/simulations/:id[/summary]` → 200 / 404                            | correct       | [covered] | `index.test.ts` "creates and retrieves an exactly 10,000-event simulation summary" and "expires simulation metadata and evicts the least-recently-used run" (404 paths) |
@@ -436,14 +441,14 @@ In test mode `App` renders `DarwinDashboard` directly with all capabilities, so 
 
 | ID     | Case                                                        | Expected | Status    | Evidence / what is missing                                                       |
 | ------ | ------------------------------------------------------------- | -------- | --------- | ----------------------------------------------------------------------------------- |
-| UI-040 | Refresh live telemetry → spinner, disabled while refreshing  | correct  | [covered] | `App.test.tsx` "keeps detailed telemetry separate from the mutation workspace"     |
+| UI-040 | Refresh live telemetry re-fetches; spinner + disabled while refreshing | correct  | [partial] | `App.test.tsx` "keeps detailed telemetry separate from the mutation workspace" clicks `Refresh live telemetry` and asserts the re-fetch. **The spinner and the disabled-while-refreshing state are not asserted** |
 | UI-041 | Live-update indicator states (paused / stale / incremental)  | aria-live | [partial] | the hook states are covered (`telemetry/useLiveTelemetry.test.tsx` "marks failures stale and recovers with a jittered retry", "pauses hidden tabs and refreshes immediately when visible"). **The rendered indicator is not asserted** |
-| UI-042 | Generate evidence gated on `count` + `canInspectEvidence`    | correct  | [covered] | `App.test.tsx` "keeps detailed telemetry separate from the mutation workspace"     |
+| UI-042 | Generate evidence gated on `count` + `canInspectEvidence`    | correct  | [gap]     | the control's label (`Generate evidence`, `App.tsx:2177`) appears in **no test file** |
 | UI-043 | Also posts fitness when a retained released execution exists | second call | [gap]  | no test asserts the second call                                                     |
 | UI-044 | Telemetry error band + Dismiss                               | correct  | [partial] | error surfacing covered by "reports named subsystem failures without discarding healthy state". **Dismiss is not asserted** |
-| UI-045 | Session index filters the trace                              | toggles  | [covered] | `App.test.tsx` "keeps detailed telemetry separate from the mutation workspace"     |
-| UI-046 | Event trace renders recent events with per-type detail       | correct  | [covered] | same test                                                                           |
-| UI-047 | Aggregate mode when `!canInspectEvidence` → summary endpoint | correct  | [covered] | `shared/src/contracts.test.ts` "keeps the default telemetry summary aggregate-only"; `index.test.ts` viewer-summary assertion |
+| UI-045 | Session index filters the trace                              | toggles  | [gap]     | the session-index `is-active` toggle (`App.tsx:2260,2271`) is asserted by no test    |
+| UI-046 | Event trace renders recent events with per-type detail       | correct  | [partial] | the per-signal `Canonical evidence trace` is asserted by the same test. **The per-type event-trace list is not** |
+| UI-047 | Aggregate mode when `!canInspectEvidence` → summary endpoint | correct  | [partial] | the contract and API halves are covered (`shared/src/contracts.test.ts` "keeps the default telemetry summary aggregate-only"; `index.test.ts` viewer-summary assertion). **The UI branch that selects the summary endpoint is not exercised** |
 
 ### 8.6 Observations — evidence pack & signal inspector
 
@@ -485,7 +490,7 @@ In test mode `App` renders `DarwinDashboard` directly with all capabilities, so 
 
 | ID     | Case                                                             | Expected by status         | Status    | Evidence / what is missing                                        |
 | ------ | ------------------------------------------------------------------ | -------------------------- | --------- | -------------------------------------------------------------------- |
-| UI-100 | `failed` → Retry repository run                                   | `startControlledEvolution` | [covered] | `App.test.tsx` "hydrates workflow state created by another operator on live refresh" |
+| UI-100 | `failed` → Retry repository run                                   | `startControlledEvolution` | [gap]     | `Retry repository run` (`App.tsx`) appears in no component or Playwright test        |
 | UI-101 | `preview_ready` → Release reviewed mutation → `POST .../release`  | correct                    | [covered] | `App.test.tsx` "shows live GPT pressure clusters, ranked mutations, and Codex handoff" |
 | UI-102 | `releasing` / `deployment_verifying` disabled labels              | correct                    | [partial] | the transitional states appear in the flow above. **The disabled labels are not asserted individually** |
 | UI-103 | `released` → confirmation + RollbackWorkspace mounts              | correct                    | [covered] | `App.test.tsx` same test (rollback workspace becomes reachable)     |
@@ -496,9 +501,9 @@ In test mode `App` renders `DarwinDashboard` directly with all capabilities, so 
 
 | ID     | Case                                                                  | Expected | Status    | Evidence / what is missing                                       |
 | ------ | ----------------------------------------------------------------------- | -------- | --------- | ------------------------------------------------------------------- |
-| UI-120 | No rollback → Prepare controlled rollback → `POST .../rollback`        | correct  | [covered] | `App.test.tsx` "shows live GPT pressure clusters, ranked mutations, and Codex handoff" (rollback dispatch) |
-| UI-121 | `preview_ready` → Release reviewed rollback → `POST .../rollback/release` | correct | [covered] | same test                                                          |
-| UI-122 | `released` → rollback confirmation; Control Room shows REVERTED        | correct  | [partial] | the API-side rollback release is covered; **the Control Room REVERTED label is not asserted** |
+| UI-120 | No rollback → Prepare controlled rollback → `POST .../rollback`        | correct  | [covered] | `e2e/demo.spec.ts` "@smoke completes the controlled evolution, archive, and rollback path" clicks the real button; `tests/e2e/demo.spec.ts` "@full completes the controlled evolution, archive, and rollback flow" repeats it. *Not covered by any component test* |
+| UI-121 | `preview_ready` → Release reviewed rollback → `POST .../rollback/release` | correct | [covered] | same two Playwright tests; the `@smoke` one also polls `/api/genome` until `rollback.status === 'released'` |
+| UI-122 | `released` → rollback confirmation shown after reload                 | correct  | [covered] | `e2e/demo.spec.ts` "@smoke completes the controlled evolution, archive, and rollback path" reloads and asserts the `ProjectFlow returned to…` confirmation. *The Control Room's REVERTED label specifically is still unasserted — tracked under UI-022* |
 
 ### 8.11 System status
 
@@ -635,7 +640,7 @@ for this system** — it derives the rate-limit `clientKey` that SEC-064 depends
 | ID     | Scenario                                                                             | Status    | Evidence / what is missing                                                    |
 | ------ | -------------------------------------------------------------------------------------- | --------- | -------------------------------------------------------------------------------- |
 | LC-001 | Connect → ingest → evidence → analyse → manifest → dispatch → callbacks → release → fitness | [covered] | `index.test.ts` "caches evidence analysis and creates a bounded Codex manifest" runs the full chain against mocked GitHub/OpenAI; `e2e/demo.spec.ts` "@smoke completes the controlled evolution, archive, and rollback path" runs it in a real browser |
-| LC-002 | Release → rollback → rollback release (REVERTED)                                      | [partial] | the API chain is covered by the same tests. **The Control Room REVERTED presentation is not asserted (UI-122)** |
+| LC-002 | Release → rollback → rollback release                                                 | [covered] | `e2e/demo.spec.ts` "@smoke completes the controlled evolution, archive, and rollback path" drives prepare → release-rollback in a real browser and polls `/api/genome` until `rollback.status === 'released'`; `tests/e2e/demo.spec.ts` "@full…" repeats it. **The Control Room's REVERTED label remains unasserted (UI-022)** |
 | LC-003 | Failed execution → recovery force-fail → retry                                         | [covered] | `repository/recovery.test.ts` "waits for the recovery window and atomically force-fails one queued run"; `repository/execution.test.ts` "retries a failed workflow as a monotonic revision" |
 | LC-004 | Callback replay at each stage                                                          | [covered] | `security/callback.test.ts` "accepts one execution-bound signature and rejects its replay"; `index.test.ts` reset-callback replay in the reset lifecycle test |
 | LC-005 | Demo reset lifecycle, including a snapshot-refresh failure mid-flight                  | [covered] | `index.test.ts` "preserves state through reset workflow and deployment failures, then clears only after baseline verification"; `persistence/reset-atomicity.test.ts` (all three cases). Rev 2's "M2 failure path `[gap]`" is closed |
@@ -676,7 +681,7 @@ original wording could not be consulted — rows say so where it matters.
 | A5 inconsistent retention constant       | API-033, NF-006      | [covered] for sweep behaviour; the constant itself is a code-review item, not a test          |
 | A6 worker JSON lacked `nosniff`          | API-009              | [covered]                                                                                     |
 | A7 `.gitignore` `.env*`                  | CI-007               | the ignore rule exists (`.gitignore:4-5`); **no test enforces it** → [gap]                    |
-| A8 god-files                             | —                    | refactor, not a test. `index.ts` is ~4,100 lines; `telemetry-repository.ts` remains the largest untested module |
+| A8 god-files                             | —                    | refactor, not a test. `index.ts` is ~4,150 lines; `telemetry-repository.ts` remains the largest untested module |
 | sec-1 fail-open capability default       | SEC-067, API-008     | [covered], and now drift-guarded (API-011)                                                    |
 | B5 scorecard rescale                     | API-089              | **[covered]** — Rev 2 listed this as unverified; the case exists and passes                   |
 | B11 manifest re-post after dispatch      | API-101              | [gap] — the existing test re-posts **before** dispatch, not after                             |
@@ -747,7 +752,8 @@ not listed here is hardening and must not be quoted as a release claim, however 
   TEL-003, TEL-005, TEL-006, TEL-007, TEL-008, TEL-009, TEL-010, TEL-012.
 - **Evidence and reasoning integrity:** API-080, API-083, API-084, API-086, API-088, API-089.
 - **Release / rollback correctness:** API-100, API-102, API-106, API-120, API-124, API-126, API-127,
-  API-128, GH-020, GH-021, GH-022, GH-040, GH-041, GH-042, GH-060, LC-001, LC-003, LC-004.
+  API-128, GH-020, GH-021, GH-022, GH-040, GH-041, GH-042, GH-060, LC-001, LC-002, LC-003, LC-004,
+  UI-120, UI-121, UI-122.
 - **Destructive-operation safety:** API-033, API-034, API-035, API-036, API-164, API-165, API-166,
   LC-005, NF-005, MIG-005.
 - **Lab correctness at the API layer:** LAB-030, LAB-032, LAB-033, LAB-035, LAB-036, LAB-039,
@@ -764,6 +770,7 @@ not listed here is hardening and must not be quoted as a release claim, however 
 | SEC-001 | The `sha256(body)` / `targetId` / `clientKey` bindings of the ingestion HMAC are unproven.                    | [partial] |
 | SEC-066 | The `local-development` full-capability bypass has no test pinning it to localhost-with-no-secrets.          | [gap]     |
 | API-162 | A wrong confirmation string must not start a destructive reset.                                              | [gap]     |
+| API-082 | An evidence pack must not be generated from too few events. `insufficient_evidence` has no test.              | [gap]     |
 
 ### 16.2 Long-term hardening (P1/P2) — tracked, never a release claim
 
@@ -791,9 +798,10 @@ Ordered by value:
 
 ## 17. Revalidation ledger — where Rev 2 was wrong
 
-Every row below was checked against a named test at `6513e43`. **28 statuses changed.** The nine
-marked ⚠ are cases where Rev 2 **claimed coverage that does not exist** — the category this
-rebaseline was commissioned to find.
+Every row below was checked against a named test at `6513e43`. **46 status corrections across 44
+cases.** The 19 rows marked ⚠ are where Rev 2 **claimed coverage that does not exist** — the
+category this rebaseline was commissioned to find. (Eighteen are wrong statuses; the nineteenth,
+LAB-001, keeps its status but carried a false sub-claim.)
 
 | Case      | Rev 2       | Rev 3      | Why                                                                                             |
 | --------- | ----------- | ---------- | ------------------------------------------------------------------------------------------------- |
@@ -807,6 +815,7 @@ rebaseline was commissioned to find.
 | ⚠ API-023 | [covered]   | [gap]      | no test ever supplies a wrong-but-present bearer token                                            |
 | ⚠ API-025 | [covered]   | [partial]  | only `inspect_evidence` routes are denied to a viewer, not the other five capabilities            |
 | API-035/036 | [gap]     | [covered]  | "deletes participant, study, and execution artifacts by explicit scope" covers all three scopes   |
+| ⚠ API-082 | [covered]   | [gap]      | `insufficient_evidence` (`index.ts:2205`, `:2365`) appears in no test file                        |
 | API-085   | [partial]   | [covered]  | "processes a deterministic 10,000-event study within a bounded budget"                            |
 | API-089   | [gap]       | [covered]  | "keeps legitimate low percentage scores low when ranking candidates" is exactly the B5 case       |
 | API-141   | [gap]       | [partial]  | repository listers now skip corrupt rows; the `/api/genome` route case remains unasserted         |
@@ -825,6 +834,14 @@ rebaseline was commissioned to find.
 | ⚠ LAB-008 | [covered]   | [gap]      | `selectMutation` has no test                                                                      |
 | LAB-010   | [partial]   | [covered]  | direct stale-poll race test added in `d753608`                                                    |
 | ⚠ LAB-031 | [covered]   | [gap]      | no `PUT` request exists in `lab/handler.test.ts`; the cited 409 belongs to LAB-041                |
+| ⚠ UI-040  | [covered]   | [partial]  | the refresh click is asserted; the spinner / disabled state is not                                |
+| ⚠ UI-042  | [covered]   | [gap]      | `Generate evidence` appears in no test file                                                       |
+| ⚠ UI-045  | [covered]   | [gap]      | the session-index `is-active` toggle is asserted by no test                                       |
+| ⚠ UI-046  | [covered]   | [partial]  | the per-signal evidence trace is asserted; the per-type event-trace list is not                   |
+| ⚠ UI-047  | [covered]   | [partial]  | contract and API halves only; the UI branch is not exercised                                      |
+| ⚠ UI-100  | [covered]   | [gap]      | `Retry repository run` appears in no component or Playwright test                                 |
+| UI-122    | [partial]   | [covered]  | the `@smoke` E2E reloads and asserts the post-rollback confirmation                                |
+| LC-002    | [partial]   | [covered]  | the rollback path is driven end-to-end in a real browser by the `@smoke` E2E                      |
 | NF-001/003/004/005 | mixed | [covered] | see §15 — NF-004 in particular went from `[gap]` to fully covered this cycle                    |
 | B5 / B11 / B3 | "verify-and-close" | resolved individually | B5 [covered], B11 [gap], B3 **unverifiable** (no matching code, and `audit-report.md` is absent) |
 
