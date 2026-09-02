@@ -1487,6 +1487,42 @@ describe('Darwin API', () => {
     expect(loaded.workspace?.projects[0]?.name).toBe('Polaris Launch');
   });
 
+  it('rejects a ProjectFlow workspace request whose study session names a different participant', async () => {
+    const secret = 'projectflow-ingestion-test-secret';
+    const environment = {
+      PROJECTFLOW_INGESTION_SECRET: secret,
+      PROJECTFLOW_PRODUCTION_URL: 'https://darwin-projectflow.pages.dev/',
+    };
+    const session = await issueStudySession(secret, {
+      studyId: 'projectflow-baseline-study',
+      participantId: 'participant-idor-victim',
+      appVersion: 'baseline',
+      evidenceClass: 'human_study',
+      deploymentOrigin: 'https://darwin-projectflow.pages.dev',
+      labExperimentId: null,
+      runId: null,
+    });
+
+    // Session was issued for participant-idor-victim; request participant-idor-attacker's
+    // workspace with it, over a signed (non-bypassed) origin.
+    const crossParticipantRequest = await signedTargetRequest(
+      '/api/studies/projectflow-baseline-study/participants/participant-idor-attacker/workspace',
+      '',
+      secret,
+      { studySessionToken: session.token },
+    );
+    expect(new URL(crossParticipantRequest.url).hostname).not.toBe(
+      'localhost',
+    );
+
+    const response = await handleRequest(crossParticipantRequest, environment);
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toMatchObject({
+      error: 'study_session_subject_mismatch',
+    });
+  });
+
   it('generates and persists a hashed evidence pack from real events', async () => {
     installOpenAIResponse(evidenceModelOutput);
     expect((await connectTargetApplication()).status).toBe(201);

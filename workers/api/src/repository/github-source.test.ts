@@ -167,12 +167,150 @@ describe('captureRepositorySnapshot', () => {
     );
   });
 
+  // These traversal fetchers deliberately answer any raw-file request with a
+  // 200 (never a 404), including the malicious path itself. That way, if the
+  // path-safety guard were ever bypassed, captureRepositorySnapshot would
+  // *succeed* instead of merely failing for an unrelated reason (like a 404),
+  // which keeps the "rejects.toThrow()" assertions below honest.
+  const traversalFetcher = (contextPaths: string[]) =>
+    vi.fn<typeof fetch>(async (input) => {
+      const url = String(input);
+      if (url.endsWith('/commits/main'))
+        return Response.json({ sha: commitSha });
+      if (url.endsWith(`/${commitSha}/darwin.target.json`)) {
+        return new Response(JSON.stringify({ ...targetConfig, contextPaths }));
+      }
+      return new Response('unexpected content reached over a traversal path');
+    });
+
+  it('rejects a context path that escapes the repository via a nested .. segment', async () => {
+    const fetcher = traversalFetcher(['docs/../../etc/passwd']);
+
+    await expect(captureRepositorySnapshot({ fetch: fetcher })).rejects.toThrow(
+      'Repository context path is unsafe: docs/../../etc/passwd',
+    );
+  });
+
+  it('rejects a bare .. context path', async () => {
+    const fetcher = traversalFetcher(['..']);
+
+    await expect(captureRepositorySnapshot({ fetch: fetcher })).rejects.toThrow(
+      'Repository context path is unsafe: ..',
+    );
+  });
+
+  it('rejects a percent-encoded %2e%2e context path', async () => {
+    const fetcher = traversalFetcher(['%2e%2e/secret.txt']);
+
+    await expect(
+      captureRepositorySnapshot({ fetch: fetcher }),
+    ).rejects.toThrow();
+  });
+
+  it('rejects a context path with a leading slash', async () => {
+    const fetcher = traversalFetcher(['/etc/passwd']);
+
+    await expect(
+      captureRepositorySnapshot({ fetch: fetcher }),
+    ).rejects.toThrow();
+  });
+
+  it('rejects an invalid commitSha override that fails the baseSha format', async () => {
+    // The commitSha override is validated before any fetch happens, so a
+    // permissive fetcher here (unlike the traversal fetchers above) still
+    // proves the guard: if the regex stopped applying, this fetcher would
+    // happily complete the whole snapshot instead of throwing.
+    const fetcher = vi.fn<typeof fetch>(async (input) => {
+      const url = String(input);
+      if (url.includes('/darwin.target.json')) {
+        return new Response(
+          JSON.stringify({ ...targetConfig, contextPaths: ['AGENTS.md'] }),
+        );
+      }
+      return new Response('# doc');
+    });
+
+    await expect(
+      captureRepositorySnapshot({ fetch: fetcher, commitSha: 'not-a-real-sha' }),
+    ).rejects.toThrow();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('rejects a malformed sha returned by the GitHub commit lookup', async () => {
+    const fetcher = vi.fn<typeof fetch>(async (input) => {
+      const url = String(input);
+      if (url.endsWith('/commits/main')) {
+        return Response.json({ sha: 'z'.repeat(40) });
+      }
+      if (url.includes('/darwin.target.json')) {
+        return new Response(
+          JSON.stringify({ ...targetConfig, contextPaths: ['AGENTS.md'] }),
+        );
+      }
+      return new Response('# doc');
+    });
+
+    await expect(
+      captureRepositorySnapshot({ fetch: fetcher }),
+    ).rejects.toThrow();
+    // The malformed sha must never be spliced into a raw.githubusercontent.com
+    // URL: only the initial commit lookup should have been attempted.
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('encodes the branch name before composing the GitHub commit lookup URL', async () => {
+    // ':' is permitted by the branch schema (StudyIdentifierSchema) but is
+    // not left untouched by encodeURIComponent, so it distinguishes an
+    // encoded lookup URL from an unencoded one without also tripping the
+    // final RepositoryContextSchema validation (which forbids '/').
+    const branch = 'release:candidate';
+    const fetcher = vi.fn<typeof fetch>(async (input) => {
+      const url = String(input);
+      if (url.includes('/commits/')) return Response.json({ sha: commitSha });
+      if (url.endsWith('/darwin.target.json')) {
+        return new Response(
+          JSON.stringify({ ...targetConfig, contextPaths: ['AGENTS.md'] }),
+        );
+      }
+      return new Response('# doc');
+    });
+
+    await captureRepositorySnapshot({ fetch: fetcher, branch });
+
+    const commitLookupUrl = String(fetcher.mock.calls[0]![0]);
+    expect(commitLookupUrl).toBe(
+      `https://api.github.com/repos/sjohnston1972/projectflow/commits/${encodeURIComponent(branch)}`,
+    );
+    expect(commitLookupUrl).toContain('/commits/release%3Acandidate');
+    expect(commitLookupUrl).not.toContain('/commits/release:candidate');
+  });
+
   it('bounds GitHub request duration', async () => {
     const fetcher = vi.fn<typeof fetch>(() => new Promise(() => undefined));
 
     await expect(
       captureRepositorySnapshot({ fetch: fetcher, requestTimeoutMs: 5 }),
     ).rejects.toThrow('GitHub request timed out');
+  });
+
+  it('applies the production GitHub request timeout default when no override is supplied', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetcher = vi.fn<typeof fetch>(() => new Promise(() => undefined));
+      const pending = captureRepositorySnapshot({ fetch: fetcher });
+      let rejected = false;
+      pending.catch(() => {
+        rejected = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(rejected).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(pending).rejects.toThrow('GitHub request timed out');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('limits concurrent context downloads', async () => {
