@@ -1760,6 +1760,68 @@ describe('Rosalind control room', () => {
     );
   });
 
+  it('reveals an exact signal on its correct page despite an active filter', async () => {
+    // jsdom does not implement scrollIntoView; revealExactSignal calls it
+    // directly on the revealed row once opened.
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = vi.fn();
+    try {
+      window.history.replaceState({}, '', '/?view=observations');
+      installApi(null, null, [], undefined, observationEvidence);
+      render(<App />);
+
+      expect(
+        await screen.findByText('Evidence pack evidence-measured-test'),
+      ).toBeVisible();
+
+      // Open the signal inspector and narrow to high severity only -- an
+      // active filter that excludes the low-severity signal we're about to
+      // reveal from the (filter-independent) ranked pressure groups list.
+      fireEvent.click(
+        document.querySelector(
+          '#signal-inspector-disclosure > summary',
+        ) as HTMLElement,
+      );
+      fireEvent.change(screen.getByLabelText('Severity'), {
+        target: { value: 'high' },
+      });
+      expect(await screen.findByText('3 of 10 signals')).toBeVisible();
+
+      // EV-010 is low severity and, unfiltered, sits on page 2 (10 signals,
+      // 8 per page). It belongs to the navigation_loop / capacity-member-1
+      // pressure group.
+      const groupSummaries = Array.from(
+        document.querySelectorAll('.pressure-group-list > details > summary'),
+      );
+      const targetSummary = groupSummaries.find(
+        (element) =>
+          element.textContent?.includes('navigation loop') &&
+          element.textContent?.includes('capacity-member-1'),
+      );
+      expect(targetSummary).toBeDefined();
+      fireEvent.click(targetSummary as HTMLElement);
+      const groupDetails = targetSummary!.closest('details') as HTMLElement;
+      const revealLink = within(groupDetails).getByText('EV-010').closest('a');
+      fireEvent.click(revealLink as HTMLElement);
+
+      // The reveal must clear the active severity filter (so unfiltered
+      // ranking/paging applies) and land on the page that actually contains
+      // EV-010 -- not get reset back to page 0 by the filter-clearing effect.
+      await waitFor(() =>
+        expect(screen.getByLabelText('Severity')).toHaveValue('all'),
+      );
+      expect(await screen.findByText('9–10 of 10')).toBeVisible();
+      const revealedRow = await waitFor(() => {
+        const row = document.getElementById('signal-EV-010');
+        expect(row).not.toBeNull();
+        return row as HTMLDetailsElement;
+      });
+      await waitFor(() => expect(revealedRow.open).toBe(true));
+    } finally {
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+    }
+  });
+
   it('locks measured study access while a baseline reset is incomplete', async () => {
     installApi(null, null, resetExecution('queued'));
     render(<App />);
