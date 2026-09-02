@@ -511,7 +511,7 @@ function DarwinDashboard({
   useEffect(() => {
     const controller = new AbortController();
 
-    fetch(`${apiBaseUrl}/api/health`, { signal: controller.signal })
+    apiFetch(`${apiBaseUrl}/api/health`, { signal: controller.signal })
       .then(async (response) => {
         if (!response.ok) throw new Error('Health request failed');
         const parsed = HealthResponseSchema.safeParse(await response.json());

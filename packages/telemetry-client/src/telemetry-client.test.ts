@@ -592,6 +592,49 @@ describe('DarwinTelemetryClient', () => {
     window.removeEventListener('unhandledrejection', unhandled);
     client.destroy();
   });
+
+  it('aborts a hung delivery once the request timeout elapses and retries', async () => {
+    vi.useFakeTimers();
+    const unhandled = vi.fn();
+    window.addEventListener('unhandledrejection', unhandled);
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(
+      (_input, init) =>
+        new Promise((_resolve, reject) => {
+          const signal = init?.signal;
+          signal?.addEventListener('abort', () => {
+            const error = new Error('This operation was aborted');
+            error.name = 'AbortError';
+            reject(error);
+          });
+        }),
+    );
+    const client = createTelemetryClient({
+      appVersion: '1.0.0',
+      studyId: 'projectflow-baseline-study',
+      participantId: 'participant-timeout',
+      endpoint: '/api/telemetry/events',
+      initialRoute: '/study',
+      flushIntervalMs: 100,
+      retryBaseMs: 1_000,
+      requestTimeoutMs: 2_000,
+      fetcher,
+    });
+    client.init();
+
+    // The flush fires at 100ms; the fetch itself never resolves. Advancing
+    // past the 2s request timeout must abort it rather than hang forever.
+    await vi.advanceTimersByTimeAsync(2_200);
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    const [, requestInit] = fetcher.mock.calls[0]!;
+    expect(requestInit?.signal?.aborted).toBe(true);
+    expect(client.health().deliveryFailures).toBe(1);
+    expect(client.health().lastDeliveryError).toContain('timed out');
+    expect(unhandled).not.toHaveBeenCalled();
+
+    window.removeEventListener('unhandledrejection', unhandled);
+    client.destroy();
+  });
 });
 
 const pointerEvent = (type: string, init: MouseEventInit = {}) => {

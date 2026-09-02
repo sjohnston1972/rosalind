@@ -26,6 +26,7 @@ export interface TelemetryClientConfig {
   maxOutboxSize?: number;
   retryBaseMs?: number;
   retryMaxMs?: number;
+  requestTimeoutMs?: number;
   random?: () => number;
   onEvent?: (event: StudyTelemetryEvent) => void;
   onHealth?: (health: TelemetryClientHealth) => void;
@@ -165,6 +166,7 @@ export class DarwinTelemetryClient {
     maxOutboxSize: number;
     retryBaseMs: number;
     retryMaxMs: number;
+    requestTimeoutMs: number;
     random: () => number;
   };
   private readonly outboxKey: string;
@@ -216,6 +218,7 @@ export class DarwinTelemetryClient {
         60 * 60 * 1_000,
         Math.max(1_000, config.retryMaxMs ?? 60_000),
       ),
+      requestTimeoutMs: clamp(config.requestTimeoutMs ?? 10_000, 1_000, 60_000),
       random: config.random ?? Math.random,
     };
     this.fetcher = config.fetcher ?? fetch.bind(globalThis);
@@ -448,6 +451,14 @@ export class DarwinTelemetryClient {
 
     const events = this.outbox.slice(0, this.config.batchSize);
     const batch = TelemetryBatchSchema.parse({ events });
+    // Bound every delivery attempt: an unresponsive endpoint must not hang
+    // the outbox forever. A timeout falls into the same retry/back-off path
+    // as any other delivery failure below.
+    const timeoutController = new AbortController();
+    const timeoutTimer = setTimeout(
+      () => timeoutController.abort(),
+      this.config.requestTimeoutMs,
+    );
     try {
       const response = await this.fetcher(this.config.endpoint, {
         method: 'POST',
@@ -459,6 +470,7 @@ export class DarwinTelemetryClient {
         },
         body: JSON.stringify(batch),
         keepalive: true,
+        signal: timeoutController.signal,
       });
       if (!response.ok) {
         return this.scheduleRetry(
@@ -485,9 +497,16 @@ export class DarwinTelemetryClient {
       this.notifyHealth();
       return { status: 'delivered', ...receipt };
     } catch (error) {
+      const timedOut = error instanceof Error && error.name === 'AbortError';
       return this.scheduleRetry(
-        error instanceof Error ? error.message : 'Telemetry delivery failed.',
+        timedOut
+          ? `Telemetry delivery timed out after ${this.config.requestTimeoutMs}ms.`
+          : error instanceof Error
+            ? error.message
+            : 'Telemetry delivery failed.',
       );
+    } finally {
+      clearTimeout(timeoutTimer);
     }
   }
 

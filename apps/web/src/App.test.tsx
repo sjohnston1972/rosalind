@@ -1246,6 +1246,7 @@ describe('Rosalind control room', () => {
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
         expect.stringContaining('/events/raw?limit=200'),
+        expect.objectContaining({ signal: expect.anything() }),
       ),
     );
   });
@@ -1426,7 +1427,7 @@ describe('Rosalind control room', () => {
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
         expect.stringContaining('/analyse-evidence'),
-        { method: 'POST' },
+        expect.objectContaining({ method: 'POST' }),
       ),
     );
     expect(fetchMock).toHaveBeenCalledWith(
