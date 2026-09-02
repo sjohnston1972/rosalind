@@ -1067,6 +1067,11 @@ export const DemoResetStatusSchema = z.enum([
 export const DemoResetExecutionSchema = z.object({
   resetId: StudyIdentifierSchema,
   status: DemoResetStatusSchema,
+  // Optimistic-concurrency token. Every persisted transition increments this,
+  // and the destructive reset (see reset-execution.ts / telemetry-repository.ts)
+  // only commits via a DB-level compare-and-swap on (status, version) so a
+  // stale or concurrent worker can never re-run the destructive step.
+  version: z.number().int().nonnegative().default(0),
   repository: z.object({
     fullName: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),
     branch: z.string().min(1).max(200),

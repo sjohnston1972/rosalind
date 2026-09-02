@@ -1,0 +1,2 @@
+ALTER TABLE reset_executions
+  ADD COLUMN version INTEGER NOT NULL DEFAULT 0;

@@ -27,6 +27,7 @@ export const createResetExecution = (
   DemoResetExecutionSchema.parse({
     resetId: `reset-${crypto.randomUUID()}`,
     status: 'queued',
+    version: 0,
     repository,
     baselineTag: resetBaselineTag,
     policyHash: resetPolicyHash,
@@ -58,6 +59,7 @@ export const updateResetExecution = (
   return DemoResetExecutionSchema.parse({
     ...execution,
     ...callback,
+    version: execution.version + 1,
     updatedAt,
     completedAt:
       callback.status === 'failed' ? updatedAt : execution.completedAt,
@@ -77,7 +79,33 @@ export const completeResetExecution = (
   return DemoResetExecutionSchema.parse({
     ...execution,
     status: 'complete',
+    version: execution.version + 1,
     deploymentVerification,
+    error: null,
+    updatedAt,
+    completedAt: updatedAt,
+  });
+};
+
+/**
+ * Computes the fully-verified "replacement state" for a reset that has no
+ * repository-driven baseline to verify against (the local/E2E immediate reset
+ * path). This performs no I/O and destroys nothing; the caller must still
+ * commit it via an atomic, CAS-gated transition before any data is reset.
+ */
+export const completeImmediateResetExecution = (
+  execution: DemoResetExecution,
+  updatedAt = new Date().toISOString(),
+) => {
+  if (execution.status !== 'queued') {
+    throw new Error(
+      `Invalid reset execution transition: ${execution.status} -> complete.`,
+    );
+  }
+  return DemoResetExecutionSchema.parse({
+    ...execution,
+    status: 'complete',
+    version: execution.version + 1,
     error: null,
     updatedAt,
     completedAt: updatedAt,

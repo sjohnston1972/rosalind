@@ -88,6 +88,7 @@ import {
   verifyProjectFlowDeployment,
 } from './repository/deployment-verification';
 import {
+  completeImmediateResetExecution,
   completeResetExecution,
   createResetExecution,
   updateResetExecution,
@@ -1014,6 +1015,10 @@ export const handleRequest = async (
         verifiedAt: verified.verifiedAt,
         lastError: null,
       };
+      // Compute and verify the full replacement state before anything is
+      // destroyed: `verified` above already confirms ProjectFlow production
+      // is serving the restored baseline commit, and `completed` is the
+      // fully-formed replacement reset-execution record.
       const completed = completeResetExecution(
         execution,
         verifiedDeployment,
@@ -1026,17 +1031,36 @@ export const handleRequest = async (
         commitSha: verified.commitSha,
         verifiedAt: verified.verifiedAt,
       });
-      resetSimulationStore();
-      await telemetryRepository.reset({ preserveResetExecutions: true });
-      await getLabRepository(env?.DB).reset();
-      await telemetryRepository.resetEvolutionCycle({
-        startedAt: verified.verifiedAt,
-        measuredCommit: verified.commitSha,
-        appVersion: verified.appVersion,
-        deploymentVerifiedAt: verified.verifiedAt,
+      // Commit the destructive reset (telemetry, lab data, evolution cycle)
+      // together with the deploying -> complete transition as a single
+      // atomic, DB-level compare-and-swap. Nothing is destroyed unless the
+      // reset_executions row still matches (status, version) exactly, and a
+      // failure partway through this call leaves the prior demo data and the
+      // execution row untouched, so a later poll can safely retry.
+      const result = await telemetryRepository.completeResetAtomically({
+        resetId: execution.resetId,
+        expectedStatus: execution.status,
+        expectedVersion: execution.version,
+        completed,
+        evolutionBoundary: {
+          startedAt: verified.verifiedAt,
+          measuredCommit: verified.commitSha,
+          appVersion: verified.appVersion,
+          deploymentVerifiedAt: verified.verifiedAt,
+        },
+        labRepository: getLabRepository(env?.DB),
       });
-      await telemetryRepository.saveResetExecution(completed);
-      return completed;
+      if (!result) {
+        // Lost the compare-and-swap: another worker already reconciled this
+        // reset (or it moved on) between our read and this attempt. Return
+        // the execution as it now stands instead of re-running the reset.
+        return (
+          (await telemetryRepository.getResetExecution(execution.resetId)) ??
+          execution
+        );
+      }
+      resetSimulationStore();
+      return result;
     } catch (error) {
       if (!(error instanceof DeploymentVerificationPendingError)) throw error;
       const pending = DemoResetExecutionSchema.parse({
@@ -1687,16 +1711,28 @@ export const handleRequest = async (
     });
     await telemetryRepository.saveResetExecution(execution);
     if (useE2EFixtures || (!env?.GITHUB_TOKEN && !env?.DARWIN_CALLBACK_TOKEN)) {
-      resetSimulationStore();
-      await telemetryRepository.reset({ preserveResetExecutions: true });
-      await getLabRepository(env?.DB).reset();
-      execution = DemoResetExecutionSchema.parse({
-        ...execution,
-        status: 'complete',
-        updatedAt: new Date().toISOString(),
-        completedAt: new Date().toISOString(),
+      // No repository-driven baseline to verify in this mode: the replacement
+      // state (an empty demo cycle) is computed up front, then committed
+      // atomically together with the queued -> complete transition below.
+      const completed = completeImmediateResetExecution(execution);
+      const result = await telemetryRepository.completeResetAtomically({
+        resetId: execution.resetId,
+        expectedStatus: execution.status,
+        expectedVersion: execution.version,
+        completed,
+        evolutionBoundary: {
+          startedAt: null,
+          measuredCommit: null,
+          appVersion: null,
+          deploymentVerifiedAt: null,
+        },
+        labRepository: getLabRepository(env?.DB),
       });
-      await telemetryRepository.saveResetExecution(execution);
+      execution =
+        result ??
+        ((await telemetryRepository.getResetExecution(execution.resetId)) ??
+          execution);
+      if (result) resetSimulationStore();
       trace.afterState = execution.status;
       return json(DemoResetResponseSchema.parse(execution));
     }

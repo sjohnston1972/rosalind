@@ -31,6 +31,15 @@ export interface LabRepository {
   getExperiment(experimentId: string): Promise<LabExperiment | null>;
   listExperiments(status?: LabExperimentStatus): Promise<LabExperiment[]>;
   reset(): Promise<void>;
+  /**
+   * Raw DELETE statements equivalent to `reset()`, left unexecuted so a caller
+   * (the demo-reset flow) can fold them into a single atomic D1 batch together
+   * with the telemetry reset and the reset-execution CAS update. Only the
+   * D1-backed implementation returns real statements; the in-memory
+   * implementation returns an empty array since callers should invoke
+   * `reset()` directly for that backend instead.
+   */
+  resetStatements(): D1PreparedStatement[];
 }
 
 const experimentStore = new Map<string, LabExperiment>();
@@ -156,6 +165,10 @@ export class InMemoryLabRepository implements LabRepository {
 
   async reset() {
     experimentStore.clear();
+  }
+
+  resetStatements(): D1PreparedStatement[] {
+    return [];
   }
 }
 
@@ -587,14 +600,18 @@ export class D1LabRepository implements LabRepository {
   }
 
   async reset() {
-    await this.database.batch([
+    await this.database.batch(this.resetStatements());
+  }
+
+  resetStatements(): D1PreparedStatement[] {
+    return [
       this.database.prepare('DELETE FROM lab_selection_results'),
       this.database.prepare('DELETE FROM lab_analyses'),
       this.database.prepare('DELETE FROM lab_evidence_records'),
       this.database.prepare('DELETE FROM lab_agent_actions'),
       this.database.prepare('DELETE FROM lab_agent_runs'),
       this.database.prepare('DELETE FROM lab_experiments'),
-    ]);
+    ];
   }
 }
 

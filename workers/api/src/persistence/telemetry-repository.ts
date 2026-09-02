@@ -13,6 +13,7 @@ import {
   TargetApplicationConnectionSchema,
   type CodexImplementationManifest,
   type DemoResetExecution,
+  type DemoResetStatus,
   type EvidenceAnalysis,
   type StoredEvidenceAnalysis,
   type EvidencePack,
@@ -81,6 +82,20 @@ import {
   expiresAt,
   retentionPolicy,
 } from './retention';
+import type { LabRepository } from '../lab/lab-repository';
+
+export interface AtomicDemoResetInput {
+  resetId: string;
+  expectedStatus: DemoResetStatus;
+  expectedVersion: number;
+  /** Fully computed, already-verified replacement execution (status 'complete'). */
+  completed: DemoResetExecution;
+  evolutionBoundary: Pick<
+    EvolutionCycle,
+    'startedAt' | 'measuredCommit' | 'appVersion' | 'deploymentVerifiedAt'
+  >;
+  labRepository: LabRepository;
+}
 
 export interface TelemetryInsertResult {
   accepted: number;
@@ -244,6 +259,26 @@ export interface TelemetryRepository {
   saveResetExecution(execution: DemoResetExecution): Promise<void>;
   getResetExecution(resetId: string): Promise<DemoResetExecution | null>;
   getLatestResetExecution(): Promise<DemoResetExecution | null>;
+  /**
+   * Commits the destructive demo reset (telemetry + lab data + the evolution
+   * cycle boundary) together with the reset-execution status transition as a
+   * single atomic, compare-and-swap-gated operation.
+   *
+   * The transition only applies when the persisted reset_executions row still
+   * matches `expectedStatus`/`expectedVersion` exactly (a real DB-level CAS —
+   * `UPDATE ... WHERE status = ? AND version = ?`, checked via the affected
+   * row count — not an in-process flag). If the row has moved on (another
+   * worker already completed it, or the state changed underneath us), this
+   * returns `null` and destroys nothing.
+   *
+   * If the underlying transaction fails partway (D1 `.batch()` rolls back the
+   * whole batch on error; the in-memory backend snapshots and restores on
+   * throw), the prior demo data and reset-execution row are left exactly as
+   * they were — recoverable by retrying the same call.
+   */
+  completeResetAtomically(
+    input: AtomicDemoResetInput,
+  ): Promise<DemoResetExecution | null>;
   saveFitnessOutcome(outcome: FitnessOutcome): Promise<void>;
   getFitnessOutcome(executionId: string): Promise<FitnessOutcome | null>;
   listFitnessOutcomes(): Promise<FitnessOutcome[]>;
@@ -347,6 +382,85 @@ const emptyOperationalMetricCounts = (): OperationalMetricCounts =>
   ) as OperationalMetricCounts;
 let evolutionCycleStore = defaultEvolutionCycle();
 let latestRetentionSweep: RetentionSweepResult | null = null;
+
+// Snapshot/restore pair backing InMemoryTelemetryRepository.completeResetAtomically.
+// This is the in-memory equivalent of a rolled-back D1 transaction: everything
+// the destructive demo reset can touch (except the reset-execution row itself,
+// which is only ever written on success) is captured before mutation and
+// restored verbatim if the attempt throws partway through.
+interface ResetableStateSnapshot {
+  eventStore: Map<string, StoredTelemetryEvent>;
+  workspaceStore: Map<string, ProjectFlowWorkspace>;
+  evidenceStore: Map<string, StoredEvidencePack>;
+  evidenceByIdStore: Map<string, StoredEvidencePack>;
+  evidenceAnalysisStore: Map<string, { studyId: string; analysis: EvidenceAnalysis }>;
+  analysisStudyStore: Map<string, { studyId: string; createdAt: string }>;
+  manifestStore: Map<string, CodexImplementationManifest>;
+  manifestStudyStore: Map<string, string>;
+  repositoryExecutionStore: Map<string, RepositoryMutationExecution>;
+  executionStudyStore: Map<string, string>;
+  fitnessOutcomeStore: Map<string, FitnessOutcome>;
+  callbackCredentialStore: Map<string, ExecutionCallbackCredential>;
+  callbackSignatureStore: Set<string>;
+  targetRequestSignatureStore: Map<string, string>;
+  operationalMetricStore: Map<OperationalMetricName, number>;
+  operationalMetricsUpdatedAt: string | null;
+  operationalEventStore: Map<string, OperationalEvent>;
+  evolutionCycleStore: EvolutionCycle;
+  latestRetentionSweep: RetentionSweepResult | null;
+}
+
+const snapshotResetableState = (): ResetableStateSnapshot => ({
+  eventStore: new Map(eventStore),
+  workspaceStore: new Map(workspaceStore),
+  evidenceStore: new Map(evidenceStore),
+  evidenceByIdStore: new Map(evidenceByIdStore),
+  evidenceAnalysisStore: new Map(evidenceAnalysisStore),
+  analysisStudyStore: new Map(analysisStudyStore),
+  manifestStore: new Map(manifestStore),
+  manifestStudyStore: new Map(manifestStudyStore),
+  repositoryExecutionStore: new Map(repositoryExecutionStore),
+  executionStudyStore: new Map(executionStudyStore),
+  fitnessOutcomeStore: new Map(fitnessOutcomeStore),
+  callbackCredentialStore: new Map(callbackCredentialStore),
+  callbackSignatureStore: new Set(callbackSignatureStore),
+  targetRequestSignatureStore: new Map(targetRequestSignatureStore),
+  operationalMetricStore: new Map(operationalMetricStore),
+  operationalMetricsUpdatedAt,
+  operationalEventStore: new Map(operationalEventStore),
+  evolutionCycleStore,
+  latestRetentionSweep,
+});
+
+const replaceMapContents = <K, V>(target: Map<K, V>, source: Map<K, V>) => {
+  target.clear();
+  for (const [key, value] of source) target.set(key, value);
+};
+
+const restoreResetableState = (snapshot: ResetableStateSnapshot) => {
+  replaceMapContents(eventStore, snapshot.eventStore);
+  replaceMapContents(workspaceStore, snapshot.workspaceStore);
+  replaceMapContents(evidenceStore, snapshot.evidenceStore);
+  replaceMapContents(evidenceByIdStore, snapshot.evidenceByIdStore);
+  replaceMapContents(evidenceAnalysisStore, snapshot.evidenceAnalysisStore);
+  replaceMapContents(analysisStudyStore, snapshot.analysisStudyStore);
+  replaceMapContents(manifestStore, snapshot.manifestStore);
+  replaceMapContents(manifestStudyStore, snapshot.manifestStudyStore);
+  replaceMapContents(repositoryExecutionStore, snapshot.repositoryExecutionStore);
+  replaceMapContents(executionStudyStore, snapshot.executionStudyStore);
+  replaceMapContents(fitnessOutcomeStore, snapshot.fitnessOutcomeStore);
+  replaceMapContents(callbackCredentialStore, snapshot.callbackCredentialStore);
+  callbackSignatureStore.clear();
+  for (const value of snapshot.callbackSignatureStore) {
+    callbackSignatureStore.add(value);
+  }
+  replaceMapContents(targetRequestSignatureStore, snapshot.targetRequestSignatureStore);
+  replaceMapContents(operationalMetricStore, snapshot.operationalMetricStore);
+  operationalMetricsUpdatedAt = snapshot.operationalMetricsUpdatedAt;
+  replaceMapContents(operationalEventStore, snapshot.operationalEventStore);
+  evolutionCycleStore = snapshot.evolutionCycleStore;
+  latestRetentionSweep = snapshot.latestRetentionSweep;
+};
 
 interface ExecutionCursor {
   updatedAt: string;
@@ -1254,6 +1368,54 @@ export class InMemoryTelemetryRepository implements TelemetryRepository {
     evolutionCycleStore = defaultEvolutionCycle();
     latestRetentionSweep = null;
   }
+
+  async completeResetAtomically(input: AtomicDemoResetInput) {
+    const current = resetExecutionStore.get(input.resetId);
+    if (
+      !current ||
+      current.status !== input.expectedStatus ||
+      current.version !== input.expectedVersion
+    ) {
+      // Lost the compare-and-swap: another worker already advanced (or
+      // failed) this reset, or the caller's view is stale. Destroy nothing.
+      return null;
+    }
+    const snapshot = snapshotResetableState();
+    try {
+      eventStore.clear();
+      workspaceStore.clear();
+      evidenceStore.clear();
+      evidenceByIdStore.clear();
+      evidenceAnalysisStore.clear();
+      analysisStudyStore.clear();
+      manifestStore.clear();
+      manifestStudyStore.clear();
+      repositoryExecutionStore.clear();
+      executionStudyStore.clear();
+      fitnessOutcomeStore.clear();
+      callbackCredentialStore.clear();
+      callbackSignatureStore.clear();
+      targetRequestSignatureStore.clear();
+      operationalMetricStore.clear();
+      operationalEventStore.clear();
+      operationalMetricsUpdatedAt = null;
+      latestRetentionSweep = null;
+      evolutionCycleStore = {
+        studyId: baselineStudyId,
+        ...input.evolutionBoundary,
+        genomeEvolutionCount: 0,
+      };
+      // Destroying the lab data is part of the same attempt: if it throws,
+      // the catch below restores everything cleared above, and the
+      // reset-execution row (set only on success, below) is never touched.
+      await input.labRepository.reset();
+      resetExecutionStore.set(input.resetId, input.completed);
+      return input.completed;
+    } catch (error) {
+      restoreResetableState(snapshot);
+      throw error;
+    }
+  }
 }
 
 export class D1TelemetryRepository implements TelemetryRepository {
@@ -2145,18 +2307,20 @@ export class D1TelemetryRepository implements TelemetryRepository {
     await this.database
       .prepare(
         `INSERT INTO reset_executions (
-          reset_id, status, updated_at, execution_json
-        ) VALUES (?, ?, ?, ?)
+          reset_id, status, updated_at, execution_json, version
+        ) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(reset_id) DO UPDATE SET
           status = excluded.status,
           updated_at = excluded.updated_at,
-          execution_json = excluded.execution_json`,
+          execution_json = excluded.execution_json,
+          version = excluded.version`,
       )
       .bind(
         execution.resetId,
         execution.status,
         execution.updatedAt,
         JSON.stringify(execution),
+        execution.version,
       )
       .run();
   }
@@ -2948,7 +3112,9 @@ export class D1TelemetryRepository implements TelemetryRepository {
     }));
   }
 
-  async reset(options?: { preserveResetExecutions?: boolean }) {
+  private demoDataResetStatements(options?: {
+    preserveResetExecutions?: boolean;
+  }): D1PreparedStatement[] {
     const statements = [
       this.database.prepare('DELETE FROM telemetry_events'),
       this.database.prepare('DELETE FROM participant_workspaces'),
@@ -2969,7 +3135,65 @@ export class D1TelemetryRepository implements TelemetryRepository {
     if (!options?.preserveResetExecutions) {
       statements.push(this.database.prepare('DELETE FROM reset_executions'));
     }
-    await this.database.batch(statements);
+    return statements;
+  }
+
+  async reset(options?: { preserveResetExecutions?: boolean }) {
+    await this.database.batch(this.demoDataResetStatements(options));
+  }
+
+  async completeResetAtomically(input: AtomicDemoResetInput) {
+    // Everything below is a single D1 batch, i.e. one real SQLite
+    // transaction: the telemetry deletes, the lab deletes, the evolution
+    // cycle boundary write, and the reset-execution CAS update all commit
+    // together or not at all. If any statement fails, D1 rolls back the
+    // entire batch, so the demo data and the reset_executions row are left
+    // exactly as they were before this call — recoverable by retrying.
+    const evolutionCycleStatement = this.database
+      .prepare(
+        `INSERT INTO demo_state (state_key, state_json, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(state_key) DO UPDATE SET
+           state_json = excluded.state_json,
+           updated_at = excluded.updated_at`,
+      )
+      .bind(
+        'evolution-cycle',
+        JSON.stringify({
+          studyId: baselineStudyId,
+          ...input.evolutionBoundary,
+          genomeEvolutionCount: 0,
+        }),
+        input.completed.updatedAt,
+      );
+    // The real compare-and-swap: this only matches (changes === 1) when the
+    // row is still exactly where we last observed it. A second worker racing
+    // the same reset, or a resumed/stale caller, gets 0 rows affected instead
+    // of clobbering a newer transition.
+    const casStatement = this.database
+      .prepare(
+        `UPDATE reset_executions
+         SET status = ?, updated_at = ?, execution_json = ?, version = ?
+         WHERE reset_id = ? AND status = ? AND version = ?`,
+      )
+      .bind(
+        input.completed.status,
+        input.completed.updatedAt,
+        JSON.stringify(input.completed),
+        input.completed.version,
+        input.resetId,
+        input.expectedStatus,
+        input.expectedVersion,
+      );
+    const statements = [
+      ...this.demoDataResetStatements({ preserveResetExecutions: true }),
+      ...input.labRepository.resetStatements(),
+      evolutionCycleStatement,
+      casStatement,
+    ];
+    const results = await this.database.batch(statements);
+    const cas = results[results.length - 1];
+    return (cas?.meta.changes ?? 0) === 1 ? input.completed : null;
   }
 }
 
