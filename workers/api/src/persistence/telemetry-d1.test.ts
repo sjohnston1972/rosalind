@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Miniflare } from 'miniflare';
-import type { CodexImplementationManifest } from '@darwin/shared';
+import type {
+  CodexImplementationManifest,
+  OperationalEvent,
+  StudyTelemetryEvent,
+} from '@darwin/shared';
 
 import {
   createRepositoryExecution,
@@ -26,7 +30,52 @@ const schema = `
   CREATE TABLE evidence_analyses (
     analysis_id TEXT PRIMARY KEY, study_id TEXT NOT NULL
   );
+  CREATE TABLE operational_events (
+    event_id TEXT PRIMARY KEY, kind TEXT NOT NULL, request_id TEXT NOT NULL,
+    occurred_at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
+    target TEXT NOT NULL, outcome TEXT NOT NULL, before_state TEXT,
+    after_state TEXT, provider TEXT, operation TEXT,
+    duration_ms INTEGER NOT NULL, error_code TEXT, event_json TEXT NOT NULL
+  );
 `;
+
+const studyEvent = (
+  overrides: Partial<StudyTelemetryEvent> &
+    Pick<StudyTelemetryEvent, 'eventId' | 'sequence'>,
+): StudyTelemetryEvent =>
+  ({
+    schemaVersion: 1,
+    sessionId: 'session-d1-test',
+    participantId: 'participant-d1-test',
+    studyId: 'study-d1-test',
+    appVersion: '1.0.0',
+    source: 'real_user',
+    occurredAt: '2026-07-19T08:00:00.000Z',
+    route: '/study/dashboard',
+    viewport: 'desktop',
+    eventType: 'page_view',
+    ...overrides,
+  }) as StudyTelemetryEvent;
+
+const operationalEvent = (
+  overrides: Partial<OperationalEvent> & Pick<OperationalEvent, 'eventId'>,
+): OperationalEvent =>
+  ({
+    kind: 'audit',
+    requestId: 'request-d1-test',
+    occurredAt: new Date().toISOString(),
+    actor: 'operator',
+    action: 'demo.reset',
+    target: 'projectflow-baseline-study',
+    outcome: 'success',
+    beforeState: null,
+    afterState: null,
+    provider: null,
+    operation: null,
+    durationMs: 12,
+    errorCode: null,
+    ...overrides,
+  }) as OperationalEvent;
 
 const manifest = {
   manifestId: 'manifest-d1-test',
@@ -144,7 +193,12 @@ describe('D1 telemetry repository boundaries', () => {
     expect(JSON.stringify(warning.mock.calls)).not.toContain('must-not-leak');
   });
 
-  it('fails closed with the poisoned record identity but not its JSON contents', async () => {
+  it('skips corrupt telemetry event rows without leaking their contents or 500ing the page', async () => {
+    const valid = studyEvent({
+      eventId: '49d13df2-8dce-4ad3-b20e-d8b4edc01b63',
+      sequence: 0,
+    });
+    await repository.insertEvents([valid], '2026-07-19T08:00:01.000Z');
     const recordId = '00000000-0000-4000-a000-000000000001';
     await database
       .prepare(
@@ -158,18 +212,65 @@ describe('D1 telemetry repository boundaries', () => {
         '1.0.0',
         'real_user',
         '2026-07-19T08:00:00.000Z',
-        '2026-07-19T08:00:01.000Z',
-        0,
+        '2026-07-19T08:00:02.000Z',
+        1,
         'page_view',
         '/dashboard',
         '{"private":"must-not-leak"}',
       )
       .run();
-    await expect(repository.listEvents('study-d1-test', 10)).rejects.toThrow(
-      recordId,
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const events = await repository.listEvents('study-d1-test', 10);
+    expect(events.map((event) => event.eventId)).toEqual([valid.eventId]);
+
+    const page = await repository.listEventPage('study-d1-test', 10);
+    expect(page.events.map((event) => event.eventId)).toEqual([
+      valid.eventId,
+    ]);
+
+    const session = await repository.listSession(
+      'study-d1-test',
+      'session-d1-test',
     );
-    await expect(
-      repository.listEvents('study-d1-test', 10),
-    ).rejects.not.toThrow('must-not-leak');
+    expect(session.map((event) => event.eventId)).toEqual([valid.eventId]);
+
+    expect(warning).toHaveBeenCalledWith(
+      '[darwin:persistence]',
+      expect.stringContaining(recordId),
+    );
+    expect(JSON.stringify(warning.mock.calls)).not.toContain('must-not-leak');
+  });
+
+  it('skips corrupt operational audit event rows without leaking their contents or 500ing the page', async () => {
+    const valid = operationalEvent({
+      eventId: '11111111-1111-4111-8111-111111111111',
+    });
+    await repository.saveOperationalEvents([valid]);
+    const corruptId = '22222222-2222-4222-8222-222222222222';
+    await database
+      .prepare(
+        `INSERT INTO operational_events (
+           event_id, kind, request_id, occurred_at, actor, action, target,
+           outcome, before_state, after_state, provider, operation,
+           duration_ms, error_code, event_json
+         ) VALUES (?, 'audit', ?, ?, 'operator', 'demo.reset', 'target', 'success', NULL, NULL, NULL, NULL, 5, NULL, ?)`,
+      )
+      .bind(
+        corruptId,
+        'request-corrupt-d1',
+        new Date().toISOString(),
+        '{"private":"must-not-leak"}',
+      )
+      .run();
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const events = await repository.listOperationalAuditEvents(10);
+    expect(events.map((event) => event.eventId)).toEqual([valid.eventId]);
+    expect(warning).toHaveBeenCalledWith(
+      '[darwin:persistence]',
+      expect.stringContaining(corruptId),
+    );
+    expect(JSON.stringify(warning.mock.calls)).not.toContain('must-not-leak');
   });
 });

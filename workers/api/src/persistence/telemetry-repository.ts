@@ -1403,15 +1403,15 @@ export class D1TelemetryRepository implements TelemetryRepository {
       .all<{ event_id: string; event_json: string; received_at: string }>();
 
     return result.results
-      .map((row) => ({
-        ...parseStoredValue(
+      .flatMap((row) => {
+        const event = parseStoredValueOrNull(
           StudyTelemetryEventSchema,
           row.event_json,
           'telemetry event',
           row.event_id,
-        ),
-        receivedAt: row.received_at,
-      }))
+        );
+        return event ? [{ ...event, receivedAt: row.received_at }] : [];
+      })
       .reverse();
   }
 
@@ -1461,15 +1461,15 @@ export class D1TelemetryRepository implements TelemetryRepository {
             event_json: string;
             received_at: string;
           }>();
-    const mapped = result.results.map((row) => ({
-      ...parseStoredValue(
+    const mapped = result.results.flatMap((row) => {
+      const event = parseStoredValueOrNull(
         StudyTelemetryEventSchema,
         row.event_json,
         'telemetry event',
         row.event_id,
-      ),
-      receivedAt: row.received_at,
-    }));
+      );
+      return event ? [{ ...event, receivedAt: row.received_at }] : [];
+    });
     return {
       events: cursor ? mapped.slice(0, limit) : mapped.reverse(),
       hasMore: Boolean(cursor && mapped.length > limit),
@@ -1492,15 +1492,15 @@ export class D1TelemetryRepository implements TelemetryRepository {
       .bind(studyId, sessionId, receivedAfter ?? null, receivedAfter ?? null)
       .all<{ event_id: string; event_json: string; received_at: string }>();
 
-    return result.results.map((row) => ({
-      ...parseStoredValue(
+    return result.results.flatMap((row) => {
+      const event = parseStoredValueOrNull(
         StudyTelemetryEventSchema,
         row.event_json,
         'telemetry event',
         row.event_id,
-      ),
-      receivedAt: row.received_at,
-    }));
+      );
+      return event ? [{ ...event, receivedAt: row.received_at }] : [];
+    });
   }
 
   async summarizeEvents(studyId: string, receivedAfter?: string | null) {
@@ -2901,14 +2901,15 @@ export class D1TelemetryRepository implements TelemetryRepository {
       )
       .bind(limit)
       .all<{ event_id: string; event_json: string }>();
-    return result.results.map((row) =>
-      parseStoredValue(
+    return result.results.flatMap((row) => {
+      const event = parseStoredValueOrNull(
         OperationalEventSchema,
         row.event_json,
         'operational event',
         row.event_id,
-      ),
-    );
+      );
+      return event ? [event] : [];
+    });
   }
 
   async summarizeOperationalMetrics(limit: number) {
