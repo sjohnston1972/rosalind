@@ -322,6 +322,63 @@ describe('DarwinTelemetryClient', () => {
     client.destroy();
   });
 
+  it('skips a batch that fails to serialize instead of aborting the beacon flush', () => {
+    const sendBeacon = vi.fn(() => true);
+    vi.stubGlobal('navigator', { ...navigator, sendBeacon });
+    const fetcher = vi.fn<typeof fetch>();
+    // Simulate a batch that cannot be JSON-serialized (e.g. a circular
+    // structure) on the first beacon-shaped call only; later batches must
+    // still go out rather than the whole flush aborting on the first error.
+    const originalStringify = JSON.stringify;
+    let beaconStringifyCalls = 0;
+    vi.spyOn(JSON, 'stringify').mockImplementation((value, ...rest) => {
+      const isBatch =
+        !!value &&
+        typeof value === 'object' &&
+        Array.isArray((value as { events?: unknown }).events);
+      // Only the beacon path's own batches should ever throw here -- the
+      // periodic fetch-flush path (also triggered by enqueue once the
+      // outbox crosses batchSize) serializes an identically shaped batch
+      // and must be left alone, so distinguish by call site.
+      const fromBeaconPath = (new Error().stack ?? '').includes(
+        'flushWithBeacon',
+      );
+      if (isBatch && fromBeaconPath) {
+        beaconStringifyCalls += 1;
+        if (beaconStringifyCalls === 1) {
+          throw new TypeError('Converting circular structure to JSON');
+        }
+      }
+      return originalStringify(
+        value as Parameters<typeof JSON.stringify>[0],
+        ...(rest as [null?, (string | number)?]),
+      );
+    });
+
+    const client = createTelemetryClient({
+      appVersion: '1.0.0',
+      studyId: 'projectflow-baseline-study',
+      participantId: 'participant-beacon-serialize',
+      endpoint: '/api/telemetry/events',
+      initialRoute: '/study',
+      batchSize: 1,
+      fetcher,
+    });
+    client.init();
+    expect(client.snapshot()).toHaveLength(2);
+
+    expect(() =>
+      window.dispatchEvent(new Event('pagehide')),
+    ).not.toThrow();
+
+    // 3 events (session_started, page_view, session_ended) at batchSize 1
+    // means 3 beacon attempts; the first fails to serialize and must be
+    // skipped, leaving the other two to still go out.
+    expect(client.snapshot()).toHaveLength(3);
+    expect(sendBeacon).toHaveBeenCalledTimes(2);
+    client.destroy();
+  });
+
   it('recovers acknowledged events after an offline retry', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-07-18T09:00:00.000Z'));

@@ -932,9 +932,18 @@ export class DarwinTelemetryClient {
       if (!events.length) continue;
       const batch = TelemetryBatchSchema.safeParse({ events });
       if (!batch.success) continue;
-      const body = JSON.stringify(batch.data);
-      if (!navigator.sendBeacon(this.config.endpoint, body)) break;
-      events.forEach((event) => this.beaconedEventIds.add(event.eventId));
+      // Serialization (or the sendBeacon call itself) must never throw here:
+      // this runs from a pagehide/visibilitychange handler, where an
+      // uncaught exception cannot be caught usefully by the host page. Skip
+      // just this batch on failure -- it stays in the outbox for the next
+      // regular fetch flush -- and keep delivering the rest.
+      try {
+        const body = JSON.stringify(batch.data);
+        if (!navigator.sendBeacon(this.config.endpoint, body)) break;
+        events.forEach((event) => this.beaconedEventIds.add(event.eventId));
+      } catch {
+        continue;
+      }
     }
   }
 
