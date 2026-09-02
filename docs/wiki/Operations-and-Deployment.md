@@ -82,6 +82,110 @@ Release merges the reviewed pull request. Rollback creates and validates a separ
 
 Set `DARWIN_OPERATOR_TOKEN`, `PROJECTFLOW_INGESTION_SECRET`, `DARWIN_RELEASE`, and `DARWIN_COMMIT_SHA` in the smoke-test environment. The smoke test rejects a deployment whose health metadata differs from that expected workflow commit, verifies one deterministic automated event, deletes its participant-scoped data immediately, and does not merge code, invoke GPT, or run a live Codex mutation.
 
+`npm run smoke:production` never dispatches a Darwin Lab experiment, so it does not prove that a managed GitHub-hosted runner can claim and complete real browser work. The check below closes that gap.
+
+## Darwin Lab managed runner smoke check
+
+This is a manual, occasional check — it is not wired into `npm run smoke:production`, CI, or any npm script, because it dispatches a real GitHub Actions run and real browser traffic against production. Run it by hand, from a shell, only when verifying the managed-runner dispatch/claim path after a change to `dispatchManagedRunner` (`workers/api/src/lab/handler.ts`), the `darwin-lab-runner.yml` workflow, or `packages/lab-runner`.
+
+### Prerequisites
+
+- Darwin API, control room, and ProjectFlow are already deployed, and `npm run smoke:production` currently passes.
+- Worker secrets `GITHUB_TOKEN` (a token with `actions:write`/`contents:read` on `sjohnston1972/darwin`) and `DARWIN_OPERATOR_TOKEN` are set (see Required secrets, above).
+- The `sjohnston1972/darwin` repository has an Actions secret named `DARWIN_OPERATOR_TOKEN` matching the Worker's operator token — the `darwin-lab-runner.yml` workflow injects it into the runner process.
+- `gh` CLI authenticated against `sjohnston1972/darwin` (`gh auth status`) with permission to list and view Actions runs.
+- The operator's `DARWIN_OPERATOR_TOKEN` value available in the shell (`$env:DARWIN_OPERATOR_TOKEN` in PowerShell).
+
+### Procedure
+
+1. Create a minimal experiment against the deployed, explicitly-allowed ProjectFlow target. Small budgets keep the check fast:
+
+   ```powershell
+   $body = @{
+     name           = "Managed runner smoke $(Get-Date -Format o)"
+     targetUrl      = "https://darwin-projectflow.pages.dev/"
+     populationSize = 1
+     maxActions     = 5
+     maxDurationMs  = 60000
+     seed           = 1859
+   } | ConvertTo-Json
+   $experiment = Invoke-RestMethod -Method Post `
+     -Uri "https://darwin-api.stevie-johnston.workers.dev/api/lab/experiments" `
+     -Headers @{ Authorization = "Bearer $env:DARWIN_OPERATOR_TOKEN" } `
+     -ContentType "application/json" -Body $body
+   $experiment.experimentId
+   ```
+
+   Expect HTTP 201, `status: "draft"`, and an `experimentId` beginning `lab-exp-`.
+
+2. Start it. This exercises the exact guarded path under test — `POST /api/lab/experiments/:id/start` must persist `awaiting_runner` first and only then call GitHub's `workflow_dispatch` for `darwin-lab-runner.yml`:
+
+   ```powershell
+   $started = Invoke-RestMethod -Method Post `
+     -Uri "https://darwin-api.stevie-johnston.workers.dev/api/lab/experiments/$($experiment.experimentId)/start" `
+     -Headers @{ Authorization = "Bearer $env:DARWIN_OPERATOR_TOKEN" }
+   $started.status
+   ```
+
+   - Pass: HTTP 200, `status: "awaiting_runner"`.
+   - If this returns HTTP 502 with `managed_runner_unavailable` (missing `GITHUB_TOKEN`) or `managed_runner_dispatch_<status>` (GitHub rejected the dispatch), stop: fix credentials or workflow permissions and restart from step 1. The experiment itself stays queued and recoverable — that failure mode is the one covered by the automated dispatch-guard tests in `workers/api/src/lab/handler.test.ts`; this manual check only needs to go further, past the dispatch call, onto a live runner.
+
+3. Confirm GitHub queued and ran the workflow for this experiment:
+
+   ```bash
+   gh run list --repo sjohnston1972/darwin --workflow=darwin-lab-runner.yml --limit 3
+   gh run watch <run-id> --repo sjohnston1972/darwin --exit-status
+   ```
+
+   Identify the matching run from its inputs (`gh run view <run-id> --repo sjohnston1972/darwin --json displayTitle`) or the "Execute real-target Darwin Lab population" step log, which prints the claimed experiment ID.
+
+4. Poll the experiment until it leaves `running`:
+
+   ```powershell
+   do {
+     Start-Sleep -Seconds 5
+     $poll = Invoke-RestMethod `
+       -Uri "https://darwin-api.stevie-johnston.workers.dev/api/lab/experiments/$($experiment.experimentId)" `
+       -Headers @{ Authorization = "Bearer $env:DARWIN_OPERATOR_TOKEN" }
+     $poll.status
+   } while ($poll.status -in @('awaiting_runner', 'running'))
+   $poll | ConvertTo-Json -Depth 6
+   ```
+
+### Pass criteria
+
+All of the following must hold:
+
+- `gh run watch` exits `0` — the GitHub Actions job itself succeeded.
+- `$poll.runnerId` matches `github-actions-<run-id>` for the run identified in step 3 — proof that a *managed* GitHub runner, not a local `npm run lab:runner` process, claimed the experiment through `POST /api/lab/experiments/:id/claim`.
+- `$poll.runs.Count -eq 1` and that run's `actions.Count -gt 0` — the population produced real browser behavior rather than tripping the zero-action infrastructure guard.
+- `$poll.status` is `completed` (or `analysed`), `$poll.evidence` is non-null, and `$poll.error` is `null`.
+
+### Distinguishing a runner failure from an agent failure
+
+- **Runner/infrastructure failure**: the GitHub Actions job itself is red (`gh run watch` exits non-zero); or the experiment ends `status: "failed"` with `error` containing "zero browser actions" (the aggregate guard in the `finish` handler, `workers/api/src/lab/handler.ts`); or an individual run has `status: "blocked"` with an `error` describing a thrown exception (navigation timeout, browser crash) rather than a task judgement (`packages/lab-runner/src/runner.ts`). Each of these means the browser or the dispatch/claim path itself never gave the agent a fair run.
+- **Agent failure**: the GitHub Actions job is green, the run's `status` is `succeeded`/`failed`/`abandoned`, `actions.length > 0`, and `taskOutcome` reflects the agent's own judgement — it acted in the browser but did, or did not, complete the goal. That is expected behavioural variance, not a runner-lifecycle defect.
+
+### Cleanup
+
+The check creates one real experiment and dispatches one real GitHub Actions run against production. Clean up immediately after a pass or a failure:
+
+```powershell
+# Archive the experiment once it is terminal (completed/analysed/failed/cancelled).
+Invoke-RestMethod -Method Post `
+  -Uri "https://darwin-api.stevie-johnston.workers.dev/api/lab/experiments/$($experiment.experimentId)/archive" `
+  -Headers @{ Authorization = "Bearer $env:DARWIN_OPERATOR_TOKEN" }
+
+# Remove the experiment-scoped study telemetry it generated.
+Invoke-RestMethod -Method Delete `
+  -Uri "https://darwin-api.stevie-johnston.workers.dev/api/studies/$($experiment.studyId)" `
+  -Headers @{ Authorization = "Bearer $env:DARWIN_OPERATOR_TOKEN" }
+```
+
+If the workflow is still `running` past its 30-minute job timeout and GitHub cannot reconcile it, use the experiment's `force-fail` action (`POST /api/lab/experiments/:id/force-fail`) with the exact experiment ID before archiving — the same recovery pattern as a stranded repository execution (see Recovery, below).
+
+> **This procedure has not been executed.** Writing it down is the acceptance-criteria deliverable; running it dispatches a real GitHub Actions workflow and real browser traffic against production infrastructure, which is explicitly out of scope for the change that added this section.
+
 ## Operational checks
 
 Before a demo or release, inspect:

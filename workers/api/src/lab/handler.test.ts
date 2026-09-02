@@ -121,6 +121,45 @@ describe('Darwin Lab API', () => {
     });
   });
 
+  it('keeps a queued experiment recoverable when GitHub rejects the dispatch call', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 503 })),
+    );
+    const createdResponse = await handleRequest(
+      request('/api/lab/experiments', 'POST', {
+        name: 'GitHub dispatch failure boundary',
+        targetUrl: 'http://localhost:5174/',
+        populationSize: 8,
+        maxActions: 12,
+        maxDurationMs: 180_000,
+        seed: 1859,
+      }),
+    );
+    const created = LabExperimentSchema.parse(await createdResponse.json());
+
+    const failed = await handleRequest(
+      request(`/api/lab/experiments/${created.experimentId}/start`, 'POST'),
+      { GITHUB_TOKEN: 'github-test-token' },
+    );
+    expect(failed.status).toBe(502);
+    await expect(failed.json()).resolves.toMatchObject({
+      error: 'lab_request_failed',
+      message: 'managed_runner_dispatch_503',
+    });
+
+    const queuedResponse = await handleRequest(
+      request(`/api/lab/experiments/${created.experimentId}`),
+    );
+    expect(
+      LabExperimentSchema.parse(await queuedResponse.json()),
+    ).toMatchObject({
+      status: 'awaiting_runner',
+      runnerId: null,
+      runs: [],
+    });
+  });
+
   it('fails an infrastructure-only population that produced zero browser actions', async () => {
     vi.stubGlobal(
       'fetch',
